@@ -3,7 +3,7 @@ import numpy as np
 class Pipe:
     """Класс для моделирования трубы в системе катодной защиты"""
     
-    def __init__(self, length=1500.0, radius=0.2, y_position=4.0):
+    def __init__(self, length=10.0, radius=0.2, y_position=4.0):
         """
         Инициализация параметров трубы
         
