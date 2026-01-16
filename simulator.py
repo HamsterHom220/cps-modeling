@@ -91,6 +91,13 @@ class CPS_DegradationSimulator:
 
         return anode_potential, pipe_potential
 
+    def _get_average_potential_on_boundary(self, boundary_type):
+        """Get average potential on anode or pipe boundary."""
+        dofs = self._get_boundary_dofs(boundary_type)
+        if len(dofs) > 0:
+            return np.mean(self.phi.x.array[dofs])
+        return 1.2 if boundary_type == 'anode' else -0.85
+
     def _calculate_boundary_currents(self):
         """Расчет токов на границах"""
         anode_dofs = self._get_boundary_dofs('anode')
@@ -216,51 +223,6 @@ class CPS_DegradationSimulator:
         
         return np.logical_and(in_anode_x, in_anode_y)
 
-    def _solve_simplified_model(self, degraded_params, t_years):
-        """
-        Упрощенное решение модели без лишних выводов
-        """
-        # Физические параметры
-        V_app = degraded_params[4]
-        T = 15.0  # Температура грунта [°C]
-        humidity = 0.8  # Влажность грунта
-        
-        # Инициализируем начальное приближение
-        self.phi.x.array[:] = -0.5
-        
-        # Упрощенный итерационный метод
-        max_iterations = 8
-        tolerance = 1e-4
-        
-        for iteration in range(max_iterations):
-            # Сохраняем предыдущее решение
-            phi_prev = fem.Function(self.V)
-            phi_prev.x.array[:] = self.phi.x.array[:]
-            
-            # Решаем с текущими граничными условиями
-            phi_new = self._solve_one_iteration(phi_prev, degraded_params, T, humidity)
-            
-            # Проверяем сходимость
-            diff = np.max(np.abs(phi_new.x.array - phi_prev.x.array))
-            
-            # Обновляем решение
-            self.phi.x.array[:] = phi_new.x.array[:]
-            
-            if diff < tolerance:
-                break
-        
-        # Расчет результатов
-        results = self._calculate_simplified_results(degraded_params, T, humidity)
-        
-        # Добавляем обязательные поля
-        results['time_years'] = t_years
-        results['V_app'] = float(V_app)
-        results['anode_efficiency'] = float(degraded_params[7])
-        results['coating_quality'] = float(degraded_params[2])
-        results['soil_resistivity'] = float(degraded_params[0])
-        
-        return results
-
     def solve_nonlinear_model(self, base_params, t_years, soil_model=None):
         """
         Быстрое решение нелинейной модели с упрощенным методом Ньютона
@@ -317,6 +279,115 @@ class CPS_DegradationSimulator:
 
         return results
 
+    def solve_with_robin_bc(self, base_params, t_years, soil_model=None):
+        """
+        Unified solver with Robin boundary conditions and proper Newton iteration.
+
+        This is the authoritative solver that:
+        1. Uses Robin BC (computes pipe potential) instead of Dirichlet (prescribes it)
+        2. Implements proper Newton iteration (12 max, tol=1e-5, damping=0.8)
+        3. Returns physically meaningful coverage metrics
+
+        Args:
+            base_params: Base system parameters [R_sigma, roughness, coating_quality, pH, V_app, humidity, age, anode_eff]
+            t_years: Time in years
+            soil_model: SoilModel instance (if None, creates new one)
+
+        Returns:
+            dict: Results including coverage, potentials, currents, etc.
+        """
+        # 1. SETUP DOMAIN AND MESH
+        if self.domain is None:
+            self.create_mesh_and_function_space()
+
+        # 2. APPLY DEGRADATION
+        degraded_params = self.apply_degradation(base_params, t_years)
+
+        # 3. SETUP SOIL MODEL
+        if soil_model is not None:
+            self.setup_soil_model(degraded_params, t_years, soil_model)
+        else:
+            # Create temporary soil model if not provided
+            from soil import SoilModel
+            temp_soil_model = SoilModel(
+                self.domain, degraded_params, self.domain_height, self.pipe.y_position,
+                enable_plotting=False
+            )
+            self.setup_soil_model(degraded_params, t_years, temp_soil_model)
+
+        # 4. CREATE BOUNDARY MARKERS (for Robin BC)
+        if not hasattr(self, 'facet_markers') or self.facet_markers is None:
+            self.mark_boundaries()
+
+        # Physical parameters
+        T = 15.0  # Temperature [°C]
+        humidity = degraded_params[5] if len(degraded_params) > 5 else 0.8
+
+        # Electrochemical equilibrium potentials
+        E_anode = 1.2   # Mg anode equilibrium [V]
+        E_pipe = -0.65  # Steel equilibrium [V]
+
+        # 5. INITIAL GUESS
+        self.phi.x.array[:] = -0.5  # Start with intermediate value
+
+        # Get initial boundary potentials
+        phi_anode_avg = self._get_average_potential_on_boundary('anode')
+        phi_pipe_avg = self._get_average_potential_on_boundary('pipe')
+
+        # 6. NEWTON ITERATION WITH ROBIN BC
+        max_iterations = 12
+        tolerance = 1e-5
+        damping = 0.8
+        converged = False
+
+        for iteration in range(max_iterations):
+            # Get potential-dependent resistances from Pipe and Anode classes
+            R_anode = self.anode.calculate_anode_resistance(phi_surface=phi_anode_avg, T=T, humidity=humidity)
+            R_pipe = self.pipe.calculate_effective_resistance(phi_surface=phi_pipe_avg, T=T, humidity=humidity)
+
+            # Ensure minimum resistances to avoid division by zero
+            R_anode = max(R_anode, 0.01)
+            R_pipe = max(R_pipe, 0.01)
+
+            # Solve Robin system with current R values
+            phi_new = self._solve_robin_linear_system(R_anode, R_pipe, E_anode, E_pipe)
+
+            # Check convergence
+            delta = np.max(np.abs(phi_new.x.array - self.phi.x.array))
+
+            if self.verbose:
+                print(f"      Newton iter {iteration + 1}: delta={delta:.2e}, R_anode={R_anode:.3f}, R_pipe={R_pipe:.3f}")
+
+            if delta < tolerance:
+                converged = True
+                if self.verbose:
+                    print(f"      Converged in {iteration + 1} iterations")
+                break
+
+            # Damped update: phi = (1-damping)*phi_old + damping*phi_new
+            self.phi.x.array[:] = (1.0 - damping) * self.phi.x.array + damping * phi_new.x.array
+
+            # Update boundary potentials for next iteration
+            phi_anode_avg = self._get_average_potential_on_boundary('anode')
+            phi_pipe_avg = self._get_average_potential_on_boundary('pipe')
+
+        if not converged and self.verbose:
+            print(f"      Warning: Newton did not converge in {max_iterations} iterations (final delta={delta:.2e})")
+
+        # 7. CALCULATE RESULTS
+        results = self._calculate_simplified_results(degraded_params, T, humidity)
+
+        # Add required fields
+        results['time_years'] = t_years
+        results['V_app'] = float(degraded_params[4])
+        results['anode_efficiency'] = float(degraded_params[7])
+        results['coating_quality'] = float(degraded_params[2])
+        results['soil_resistivity'] = float(degraded_params[0])
+        results['newton_converged'] = converged
+        results['newton_iterations'] = iteration + 1
+
+        return results
+
     def _get_initial_guess(self, params, T, humidity):
         """
         Физически обоснованное начальное приближение
@@ -366,57 +437,6 @@ class CPS_DegradationSimulator:
         phi_guess.x.array[:] = phi_values
         return phi_guess
 
-    def _build_fast_newton_system(self, params, T, humidity):
-        """
-        Быстрое построение системы для метода Ньютона
-        """
-        
-        # Основная форма: ∇·(σ∇φ) = 0
-        u = ufl.TrialFunction(self.V)
-        v = ufl.TestFunction(self.V)
-        
-        # Якобиан (линеаризованная система)
-        J_form = ufl.inner(self.sigma * ufl.grad(u), ufl.grad(v)) * ufl.dx
-        
-        # Добавляем граничные условия (упрощенные)
-        R_anode = self._calculate_anode_resistance(params, T, humidity)
-        R_pipe = self._calculate_pipe_resistance(params, T, humidity)
-        
-        # Используем текущее решение для линеаризации
-        phi_current = self.phi
-        
-        # Находим DOF на границах
-        anode_dofs, pipe_dofs = self._get_boundary_dofs()
-        
-        if len(anode_dofs) > 0 and len(pipe_dofs) > 0:
-            # Средние потенциалы на границах
-            phi_anode_avg = np.mean(phi_current.x.array[anode_dofs])
-            phi_pipe_avg = np.mean(phi_current.x.array[pipe_dofs])
-            
-            # Линеаризованные граничные условия
-            # Для анода: i = (φ - E_anode)/R_anode
-            E_anode = 1.2
-            # Для трубы: i = (φ - E_pipe)/R_pipe  
-            E_pipe = -0.65
-            
-            # В слабой форме это дает дополнительный вклад в матрицу
-            # Но для простоты используем условия Дирихле с эффективными потенциалами
-            
-            # Эффективные потенциалы с учетом тока
-            I_est = (phi_anode_avg - phi_pipe_avg) / (R_anode + R_pipe)
-            target_anode = E_anode + R_anode * I_est
-            target_pipe = E_pipe - R_pipe * I_est
-            
-            # Правая часть F(φ)
-            F_form = ufl.inner(self.sigma * ufl.grad(phi_current), ufl.grad(v)) * ufl.dx
-            
-            # Добавляем невязку от граничных условий
-            # Упрощенно: F += (φ - φ_target) * v на границах
-            
-            return form(F_form), form(J_form)
-        
-        return None, None
-
     def _calculate_nonlinear_results(self, params, T, humidity):
         """
         Расчет результатов с учетом нелинейных эффектов
@@ -454,80 +474,6 @@ class CPS_DegradationSimulator:
         )
         
         return results
-
-    def _solve_one_iteration(self, phi_prev, params, T, humidity):
-        """
-        Одна итерация с использованием методов из pipe.py и eage.py
-        """
-        # Создаем новую функцию для решения
-        phi_new = fem.Function(self.V)
-        
-        # Получаем параметры граничных условий из соответствующих классов
-        pipe_params = self.pipe.get_boundary_condition_parameters(T, humidity)
-        anode_params = self.anode.get_boundary_condition_parameters(params[4], T, humidity)
-        
-        # Находим DOF на границах
-        anode_dofs = self._get_boundary_dofs('anode')
-        pipe_dofs = self._get_boundary_dofs('pipe')
-        
-        # Рассчитываем целевые потенциалы с учетом нелинейности
-        if len(anode_dofs) > 0 and len(pipe_dofs) > 0:
-            # Средние потенциалы из предыдущей итерации
-            phi_anode_avg = np.mean(phi_prev.x.array[anode_dofs])
-            phi_pipe_avg = np.mean(phi_prev.x.array[pipe_dofs])
-            
-            # Используем методы из классов для расчета сопротивлений
-            # Исправляем: вызываем методы правильно
-            R_anode = self.anode.calculate_anode_resistance(phi_surface=phi_anode_avg, T=T, humidity=humidity)
-            R_pipe = self.pipe.calculate_effective_resistance(phi_surface=phi_pipe_avg, T=T, humidity=humidity)
-            
-            # Расчет тока через систему
-            delta_V = anode_params['E_anode'] - pipe_params['E_target']
-            R_total = R_anode + R_pipe
-            
-            if R_total > 0:
-                I_est = delta_V / R_total
-            else:
-                I_est = 0.01  # По умолчанию
-            
-            # Целевые потенциалы с учетом падения напряжения
-            target_anode = anode_params['E_anode'] - R_anode * I_est
-            target_pipe = pipe_params['E_target'] + R_pipe * I_est
-        else:
-            # Простые значения если не нашли DOF
-            print(f"          ⚠️  Не найдены DOF на границах: анод={len(anode_dofs)}, труба={len(pipe_dofs)}")
-            target_anode = params[4] * params[7]
-            target_pipe = -0.85
-        
-        # Устанавливаем граничные условия Дирихле
-        bc_anode = fem.dirichletbc(default_scalar_type(target_anode), anode_dofs, self.V)
-        bc_pipe = fem.dirichletbc(default_scalar_type(target_pipe), pipe_dofs, self.V)
-        bcs = [bc_anode, bc_pipe]
-        
-        # Решение линейной системы
-        u = ufl.TrialFunction(self.V)
-        v = ufl.TestFunction(self.V)
-        
-        a = ufl.inner(self.sigma * ufl.grad(u), ufl.grad(v)) * ufl.dx
-        L = fem.Constant(self.domain, default_scalar_type(0.0)) * v * ufl.dx
-        
-        A = fem.petsc.assemble_matrix(fem.form(a), bcs=bcs)
-        A.assemble()
-        
-        b = fem.petsc.assemble_vector(fem.form(L))
-        fem.petsc.apply_lifting(b, [fem.form(a)], bcs=[bcs])
-        b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
-        fem.petsc.set_bc(b, bcs)
-        
-        solver = PETSc.KSP().create(self.domain.comm)
-        solver.setOperators(A)
-        solver.setType(PETSc.KSP.Type.CG)
-        solver.setTolerances(rtol=1e-8, max_it=1000)
-        
-        solver.solve(b, phi_new.x.petsc_vec)
-        phi_new.x.scatter_forward()
-        
-        return phi_new
 
     def _calculate_simplified_results(self, params, T, humidity):
         """
@@ -704,136 +650,67 @@ class CPS_DegradationSimulator:
         
         solver.solve(b, uh.x.petsc_vec)
         uh.x.scatter_forward()
-        
+
         return uh
 
-    def _build_nonlinear_system(self, phi, params, T, humidity):
+    def _solve_robin_linear_system(self, R_anode, R_pipe, E_anode=1.2, E_pipe=-0.65):
         """
-        Построение нелинейной системы F(φ)=0 и её Якобиана J(φ)
-        Включает электрохимические нелинейности
-        """
-        from dolfinx.fem import form
-        
-        # Электрохимические параметры
-        V_app = params[4]
-        T_K = T + 273.15  # Температура в Кельвинах
-        
-        # Функции для нелинейных коэффициентов
-        def anode_current_density(phi_surface):
-            """Ток на аноде: Батлер-Вольмер с ограничением"""
-            # Параметры для магниевого анода
-            E_eq = 1.2  # Равновесный потенциал [В]
-            i0 = 1e-4 * (humidity ** 0.5)  # Плотность тока обмена [А/м²]
-            alpha_a = 0.5  # Коэффициент переноса анодной реакции
-            n = 2  # Число электронов
-            
-            # Уравнение Батлер-Вольмера
-            eta = phi_surface - E_eq  # Перенапряжение
-            F = 96485  # Постоянная Фарадея [Кл/моль]
-            R = 8.314  # Газовая постоянная [Дж/(моль·К)]
-            
-            i_bv = i0 * (np.exp(alpha_a * n * F * eta / (R * T_K)) - 
-                        np.exp(-(1 - alpha_a) * n * F * eta / (R * T_K)))
-            
-            # Ограничение по диффузии (если нужно)
-            i_lim = 0.1  # Предельный ток [А/м²]
-            
-            return i_bv  # Пока без ограничения
-        
-        def pipe_current_density(phi_surface):
-            """Ток на трубе: катодная реакция восстановления кислорода"""
-            # Параметры для катодной реакции на стали
-            E_eq = 0.401  # Равновесный потенциал O2/H2O [В]
-            i0 = 1e-6 * (humidity ** 0.3)  # Плотность тока обмена [А/м²]
-            alpha_c = 0.5  # Коэффициент переноса катодной реакции
-            n = 4  # Число электронов
-            
-            eta = phi_surface - E_eq  # Перенапряжение (отрицательное для катода)
-            F = 96485
-            R = 8.314
-            
-            # Уравнение Батлер-Вольмера для катода
-            i_bv = i0 * (np.exp(-alpha_c * n * F * eta / (R * T_K)) - 
-                        np.exp((1 - alpha_c) * n * F * eta / (R * T_K)))
-            
-            # Диффузионное ограничение (поступление кислорода)
-            i_lim_oxygen = 0.01 * humidity  # Зависит от влажности и пористости
-            
-            if abs(i_bv) > i_lim_oxygen:
-                return -i_lim_oxygen * np.sign(i_bv)
-            
-            return i_bv
-        
-        # Основная нелинейная форма
-        u = ufl.TrialFunction(self.V)
-        v = ufl.TestFunction(self.V)
-        phi_func = phi  # φ как функция
-        
-        # Уравнение в объеме: ∇·(σ∇φ) = 0
-        F_vol = ufl.inner(self.sigma * ufl.grad(phi_func), ufl.grad(v)) * ufl.dx
-        
-        # Граничные условия (нелинейные)
-        # Получаем мерии для границ
-        ds = ufl.Measure("ds", domain=self.domain)
-        
-        # Ток на аноде как функция потенциала
-        # В слабой форме: ∫ i(φ)·v ds
-        # Но i(φ) нелинейная, поэтому нужна линеаризация
-        
-        # Для метода Ньютона нам нужно:
-        # 1. F(φ) = A(φ) - b
-        # 2. J(φ) = dF/dφ
-        
-        # Построим сначала F(φ)
-        # В UFL это сложно, поэтому будем использовать приближение
-        
-        # Альтернатива: метод последовательных приближений
-        # с замороженными коэффициентами
-        
-        # Упрощенный подход: линеаризуем вручную
-        # F(φ) = ∫σ∇φ·∇v dx + ∫g(φ)v ds
-        # где g(φ) = i(φ) - граничный ток
-        
-        # Для Якобиана: J(φ)[δφ] = ∫σ∇δφ·∇v dx + ∫g'(φ)δφ v ds
-        
-        # Создаем тестовые функции для Якобиана
-        w = ufl.TrialFunction(self.V)  # δφ для Якобиана
-        
-        # Якобиан
-        J_form = ufl.inner(self.sigma * ufl.grad(w), ufl.grad(v)) * ufl.dx
-        
-        # Добавляем производные граничных условий
-        # g'(φ) для анода
-        # Упрощенно: g'(φ) ≈ 1/R_eff(φ)
+        Solve the Robin boundary condition linear system.
 
-        # Используем методы из классов Pipe и Anode для расчета сопротивлений
-        # Получаем средний потенциал (приблизительно)
-        phi_avg = np.mean(phi.x.array) if hasattr(phi.x, 'array') else 0.0
-        R_eff_anode = self.anode.calculate_anode_resistance(phi_surface=phi_avg, T=T, humidity=humidity)
-        R_eff_pipe = self.pipe.calculate_effective_resistance(phi_surface=phi_avg, T=T, humidity=humidity)
-        
-        # Добавляем в Якобиан
+        Uses meshtags for boundaries:
+        - ds_anode with ID=6
+        - ds_pipe with ID=5
+
+        Bilinear form: a = inner(sigma*grad(u), grad(v))*dx + (1/R_anode)*u*v*ds_anode + (1/R_pipe)*u*v*ds_pipe
+        Linear form: L = (E_anode/R_anode)*v*ds_anode + (E_pipe/R_pipe)*v*ds_pipe
+
+        Args:
+            R_anode: Anode resistance [Ohm*m^2]
+            R_pipe: Pipe effective resistance [Ohm*m^2]
+            E_anode: Anode equilibrium potential [V] (default 1.2V for Mg)
+            E_pipe: Pipe equilibrium potential [V] (default -0.65V for steel)
+
+        Returns:
+            phi_new: Solution function
+        """
+        # Ensure facet_markers exist
+        if not hasattr(self, 'facet_markers') or self.facet_markers is None:
+            self.mark_boundaries()
+
+        # Create measures for boundaries using meshtags
         ds_anode = ufl.Measure("ds", domain=self.domain, subdomain_data=self.facet_markers, subdomain_id=6)
         ds_pipe = ufl.Measure("ds", domain=self.domain, subdomain_data=self.facet_markers, subdomain_id=5)
-        
-        J_form += (1.0/R_eff_anode) * w * v * ds_anode
-        J_form += (1.0/R_eff_pipe) * w * v * ds_pipe
-        
-        # Правая часть F(φ)
-        F_form = ufl.inner(self.sigma * ufl.grad(phi_func), ufl.grad(v)) * ufl.dx
-        
-        # Добавляем нелинейные граничные условия
-        # Нужно вычислить i(φ) в точках границы
-        # В UFL это сложно, поэтому используем приближение:
-        # i(φ) ≈ (φ - E_eq)/R_eff
-        
-        E_anode_eq = 1.2
-        E_pipe_eq = -0.65
-        
-        F_form += ((phi_func - E_anode_eq)/R_eff_anode) * v * ds_anode
-        F_form += ((phi_func - E_pipe_eq)/R_eff_pipe) * v * ds_pipe
-        
-        return form(F_form), form(J_form)
+
+        # Trial and test functions
+        u = ufl.TrialFunction(self.V)
+        v = ufl.TestFunction(self.V)
+
+        # Bilinear form: volume term + Robin BC terms
+        a = ufl.inner(self.sigma * ufl.grad(u), ufl.grad(v)) * ufl.dx
+        a += (1.0 / R_anode) * u * v * ds_anode
+        a += (1.0 / R_pipe) * u * v * ds_pipe
+
+        # Linear form: Robin BC source terms
+        L = (E_anode / R_anode) * v * ds_anode + (E_pipe / R_pipe) * v * ds_pipe
+
+        # Assemble and solve
+        phi_new = fem.Function(self.V)
+
+        A = fem.petsc.assemble_matrix(fem.form(a))
+        A.assemble()
+
+        b = fem.petsc.assemble_vector(fem.form(L))
+        b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+
+        solver = PETSc.KSP().create(self.domain.comm)
+        solver.setOperators(A)
+        solver.setType(PETSc.KSP.Type.CG)
+        solver.setTolerances(rtol=1e-10, max_it=2000)
+
+        solver.solve(b, phi_new.x.petsc_vec)
+        phi_new.x.scatter_forward()
+
+        return phi_new
 
     def _solve_linear_system(self, J_form, F_form):
         """
@@ -1060,134 +937,6 @@ class CPS_DegradationSimulator:
         
         print(f"        ✓ Валидация завершена")
 
-    def _solve_linear_approximation(self, params, t_years):
-        """Линейное приближение для начального решения"""
-        # Используем существующий линейный метод
-        V_app = params[4]
-        anode_efficiency = params[7]
-        
-        # Простые граничные условия Дирихле
-        anode_potential = V_app * anode_efficiency
-        pipe_potential = -0.85
-        
-        # Граничные условия (как в solve_nonlinear_model)
-        def anode_boundary(x):
-            in_x = (9.0 <= x[0]) & (x[0] <= 11.0)
-            in_y = (1.0 <= x[1]) & (x[1] <= 2.0)
-            return np.logical_and(in_x, in_y)
-        
-        def pipe_boundary(x):
-            pipe_y = self.pipe.y_position
-            in_x = (5.0 <= x[0]) & (x[0] <= 15.0)
-            in_y = (pipe_y - 0.3 <= x[1]) & (x[1] <= pipe_y + 0.3)
-            return np.logical_and(in_x, in_y)
-        
-        anode_dofs = fem.locate_dofs_geometrical(self.V, anode_boundary)
-        pipe_dofs = fem.locate_dofs_geometrical(self.V, pipe_boundary)
-        
-        bc_anode = fem.dirichletbc(default_scalar_type(anode_potential), anode_dofs, self.V)
-        bc_pipe = fem.dirichletbc(default_scalar_type(pipe_potential), pipe_dofs, self.V)
-        
-        # Решение линейной задачи
-        uh = fem.Function(self.V)
-        
-        u = ufl.TrialFunction(self.V)
-        v = ufl.TestFunction(self.V)
-        
-        a = ufl.inner(self.sigma * ufl.grad(u), ufl.grad(v)) * ufl.dx
-        L = fem.Constant(self.domain, default_scalar_type(0.0)) * v * ufl.dx
-        
-        A = fem.petsc.assemble_matrix(fem.form(a), bcs=[bc_anode, bc_pipe])
-        A.assemble()
-        
-        b = fem.petsc.assemble_vector(fem.form(L))
-        fem.petsc.apply_lifting(b, [fem.form(a)], bcs=[[bc_anode, bc_pipe]])
-        b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
-        fem.petsc.set_bc(b, [bc_anode, bc_pipe])
-        
-        solver = PETSc.KSP().create(self.domain.comm)
-        solver.setOperators(A)
-        solver.setType(PETSc.KSP.Type.CG)
-        solver.solve(b, uh.x.petsc_vec)
-        uh.x.scatter_forward()
-        
-        return uh
-    
-    def _solve_one_nonlinear_iteration(self, phi_prev, params, t_years, soil_conductivity):
-        """
-        Одна итерация нелинейного решения
-        Использует метод Ньютона или простой итерации
-        """
-        # Параметры
-        V_app = params[4]
-        
-        # Создаем новую функцию для решения
-        phi_new = fem.Function(self.V)
-        
-        # 1. ВЫЧИСЛЯЕМ НЕЛИНЕЙНЫЕ ГРАНИЧНЫЕ УСЛОВИЯ НА ОСНОВЕ phi_prev
-        
-        # Находим DOF на границах
-        def anode_boundary(x):
-            in_x = (9.0 <= x[0]) & (x[0] <= 11.0)
-            in_y = (1.0 <= x[1]) & (x[1] <= 2.0)
-            return np.logical_and(in_x, in_y)
-        
-        def pipe_boundary(x):
-            pipe_y = self.pipe.y_position
-            in_x = (5.0 <= x[0]) & (x[0] <= 15.0)
-            in_y = (pipe_y - 0.3 <= x[1]) & (x[1] <= pipe_y + 0.3)
-            return np.logical_and(in_x, in_y)
-        
-        anode_dofs = fem.locate_dofs_geometrical(self.V, anode_boundary)
-        pipe_dofs = fem.locate_dofs_geometrical(self.V, pipe_boundary)
-        
-        # 2. ЛИНЕАРИЗАЦИЯ ГРАНИЧНЫХ УСЛОВИЙ (метод Ньютона)
-        
-        # Для трубы: i = f(φ) ≈ f(φ_prev) + f'(φ_prev)·(φ - φ_prev)
-        # Уравнение: ∇·(σ∇φ) = 0 с граничным условием σ∂φ/∂n = i(φ)
-        
-        u = ufl.TrialFunction(self.V)
-        v = ufl.TestFunction(self.V)
-        
-        # Основное уравнение в объеме
-        a = ufl.inner(self.sigma * ufl.grad(u), ufl.grad(v)) * ufl.dx
-        
-        # Правая часть (начальное приближение)
-        L = fem.Constant(self.domain, default_scalar_type(0.0)) * v * ufl.dx
-        
-        # Добавляем граничные условия для трубы (сопротивление покрытия)
-        R_pipe = self.pipe.calculate_coating_resistance()
-        if R_pipe > 0:
-            # Линеаризованное условие: i = (φ - E_pipe)/R
-            E_pipe = -0.85  # Целевой потенциал защиты
-            # Создаем меру для границы трубы
-            ds_pipe = ufl.Measure("ds", domain=self.domain)
-            # Добавляем в слабую форму
-            a += (1.0 / R_pipe) * u * v * ds_pipe
-            L += (E_pipe / R_pipe) * v * ds_pipe
-        
-        # Добавляем граничные условия для анода
-        R_anode = 0.1  # Сопротивление выхода анода
-        E_anode = V_app * params[7]
-        ds_anode = ufl.Measure("ds", domain=self.domain)
-        a += (1.0 / R_anode) * u * v * ds_anode
-        L += (E_anode / R_anode) * v * ds_anode
-        
-        # 3. РЕШЕНИЕ ЛИНЕАРИЗОВАННОЙ ЗАДАЧИ
-        A = fem.petsc.assemble_matrix(fem.form(a))
-        A.assemble()
-        
-        b = fem.petsc.assemble_vector(fem.form(L))
-        b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
-        
-        solver = PETSc.KSP().create(self.domain.comm)
-        solver.setOperators(A)
-        solver.setType(PETSc.KSP.Type.CG)
-        solver.solve(b, phi_new.x.petsc_vec)
-        phi_new.x.scatter_forward()
-        
-        return phi_new
-    
     def _calculate_current_distribution(self, params, soil_conductivity):
         """Расчет распределения тока"""
         
@@ -1246,170 +995,6 @@ class CPS_DegradationSimulator:
             return avg_current * pipe_length_in_domain
         
         return 0.0
-
-    def solve_mixed_boundary_model(self, base_params, t_years, soil_model=None):
-        """
-        Модель со смешанными граничными условиями:
-        - На аноде: Дирихле (фиксированный потенциал)
-        - На трубе: Нейман (заданная плотность тока)
-
-        Args:
-            base_params: Базовые параметры системы
-            t_years: Время эксплуатации (лет)
-            soil_model: Модель грунта (SoilModel). Если None, создается новая.
-        """
-
-        if self.domain is None:
-            self.create_mesh_and_function_space()
-
-        # Применение деградации
-        degraded_params = self.apply_degradation(base_params, t_years)
-
-        # Настройка модели грунта - создаем новую если не передана
-        if soil_model is None:
-            soil_model = SoilModel(
-                self.domain, degraded_params, self.domain_height, self.pipe.y_position,
-                enable_plotting=False
-            )
-        # Используем SoilModel.get_conductivity() для получения проводимости
-        self.setup_soil_model(degraded_params, t_years, soil_model)
-        
-        V_app = degraded_params[4]
-        anode_efficiency = degraded_params[7]
-        
-        # 1. ГРАНИЧНЫЕ УСЛОВИЯ
-        # Анод: Дирихле
-        anode_potential = V_app * anode_efficiency
-        
-        def anode_boundary(x):
-            in_x = (9.0 <= x[0]) & (x[0] <= 11.0)
-            in_y = (1.0 <= x[1]) & (x[1] <= 2.0)
-            return np.logical_and(in_x, in_y)
-        
-        anode_dofs = fem.locate_dofs_geometrical(self.V, anode_boundary)
-        bc_anode = fem.dirichletbc(default_scalar_type(anode_potential), anode_dofs, self.V)
-        
-        # Труба: заданная плотность тока (условие Неймана)
-        # В слабой форме это добавляется в правую часть
-        
-        # 2. СЛАБАЯ ФОРМА
-        u = ufl.TrialFunction(self.V)
-        v = ufl.TestFunction(self.V)
-        
-        a = ufl.inner(self.sigma * ufl.grad(u), ufl.grad(v)) * ufl.dx
-        
-        # Правая часть: граничные условия Неймана для трубы
-        # Плотность тока на трубе: i_pipe = (E_target - u)/R_coating
-        E_target = -0.85  # Целевой потенциал
-        R_coating = self.pipe.calculate_coating_resistance()
-        
-        # Определяем границу трубы
-        def pipe_boundary(x):
-            pipe_y = self.pipe.y_position
-            in_x = (5.0 <= x[0]) & (x[0] <= 15.0)
-            in_y = (pipe_y - 0.3 <= x[1]) & (x[1] <= pipe_y + 0.3)
-            return np.logical_and(in_x, in_y)
-        
-        # Создаем меру для границы трубы
-        # В UFL это делается через субдомены
-        # Для простоты добавим как часть правой части
-        
-        L = fem.Constant(self.domain, default_scalar_type(0.0)) * v * ufl.dx
-        
-        # Если хотим точно задать граничные условия Неймана,
-        # нужно создавать субдомены. Упростим:
-        
-        # 3. РЕШЕНИЕ
-        uh = fem.Function(self.V)
-        
-        A = fem.petsc.assemble_matrix(fem.form(a), bcs=[bc_anode])
-        A.assemble()
-        
-        b = fem.petsc.assemble_vector(fem.form(L))
-        fem.petsc.apply_lifting(b, [fem.form(a)], bcs=[[bc_anode]])
-        b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
-        fem.petsc.set_bc(b, [bc_anode])
-        
-        solver = PETSc.KSP().create(self.domain.comm)
-        solver.setOperators(A)
-        solver.setType(PETSc.KSP.Type.CG)
-        solver.solve(b, uh.x.petsc_vec)
-        uh.x.scatter_forward()
-        
-        self.phi.x.array[:] = uh.x.array[:]
-        
-        # 4. РАСЧЕТ РЕЗУЛЬТАТОВ
-        results = self.calculate_results(degraded_params, t_years)
-        
-        return results
-    
-    def solve_nonlinear_model_with_sigma(self, base_params, t_years, sigma_func=None):
-        """
-        Решение нелинейной модели с уже заданной проводимостью
-        """
-        # Выключаем вывод если не в режиме verbose
-        if not self.verbose:
-            import sys
-            import io
-            old_stdout = sys.stdout
-            sys.stdout = io.StringIO()
-        
-        try:
-            if self.domain is None:
-                self.create_mesh_and_function_space()
-            
-            # Применение деградации
-            degraded_params = self.apply_degradation(base_params, t_years)
-            
-            # Используем переданную проводимость
-            if sigma_func is not None:
-                self.sigma.x.array[:] = sigma_func.x.array[:]
-            
-            # Физические параметры
-            V_app = degraded_params[4]
-            T = 15.0  # Температура грунта [°C]
-            humidity = 0.8  # Влажность грунта
-            
-            # 1. НАЧАЛЬНОЕ ПРИБЛИЖЕНИЕ
-            self.phi.x.array[:] = -0.5  # Среднее значение
-            
-            # 2. УПРОЩЕННЫЙ ИТЕРАЦИОННЫЙ МЕТОД
-            max_iterations = 8
-            tolerance = 1e-4
-            
-            for iteration in range(max_iterations):
-                # Сохраняем предыдущее решение
-                phi_prev = fem.Function(self.V)
-                phi_prev.x.array[:] = self.phi.x.array[:]
-                
-                # Решаем с текущими граничными условиями
-                phi_new = self._solve_one_iteration(phi_prev, degraded_params, T, humidity)
-                
-                # Проверяем сходимость
-                diff = np.max(np.abs(phi_new.x.array - phi_prev.x.array))
-                
-                # Обновляем решение
-                self.phi.x.array[:] = phi_new.x.array[:]
-                
-                if diff < tolerance:
-                    break
-            
-            # 3. РАСЧЕТ РЕЗУЛЬТАТОВ
-            results = self._calculate_simplified_results(degraded_params, T, humidity)
-            
-            # Добавляем обязательные поля
-            results['time_years'] = t_years
-            results['V_app'] = float(V_app)
-            results['anode_efficiency'] = float(degraded_params[7])
-            results['coating_quality'] = float(degraded_params[2])
-            results['soil_resistivity'] = float(degraded_params[0])
-            
-            return results
-            
-        finally:
-            # Восстанавливаем stdout
-            if not self.verbose:
-                sys.stdout = old_stdout
 
     def apply_degradation(self, base_params, t_years):
         """Применение износа ко всем компонентам системы"""

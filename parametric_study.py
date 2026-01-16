@@ -177,12 +177,9 @@ class CPS_DatasetGenerator:
                 sigma_values = simulator.sigma.x.array
                 print(f"    Проводимость: min={np.min(sigma_values):.4f}, "
                     f"max={np.max(sigma_values):.4f} S/m")
-            
-            # Применяем деградацию
-            degraded_params = simulator.apply_degradation(base_params, t)
-            
-            # Решаем модель с уже установленной проводимостью
-            results = simulator._solve_simplified_model(degraded_params, t)
+
+            # Solve with Robin BC (includes degradation internally)
+            results = simulator.solve_with_robin_bc(base_params, t, soil_model)
             
             # Добавляем данные полей для визуализации
             if results is not None:
