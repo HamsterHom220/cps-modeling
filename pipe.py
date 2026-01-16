@@ -161,3 +161,87 @@ class Pipe:
         pipe_start = (domain_width - self.length) / 2
         pipe_end = (domain_width + self.length) / 2
         return pipe_start, pipe_end, self.y_position, self.radius
+    
+    def calculate_coating_resistance_detailed(self, t_years=None, humidity=0.8):
+        """
+        Детальный расчет сопротивления покрытия с учетом деградации
+        """
+        if t_years is None:
+            t_years = self.age_years
+        
+        coating_quality = self.coating_quality
+        
+        # Базовое сопротивление идеального покрытия [Ом·м²]
+        R_perfect = 1e6
+        
+        # Влияние качества (экспоненциальная зависимость)
+        R_quality = R_perfect * (coating_quality ** 2)
+        
+        # Деградация со временем
+        degradation_rate = 0.1 * (1.0 - coating_quality)
+        R_time = R_quality * np.exp(-degradation_rate * t_years)
+        
+        # Минимальное сопротивление через дефекты
+        defect_factor = 1.0 - coating_quality
+        R_defects = 100.0 / max(defect_factor, 0.01)
+        
+        # Общее сопротивление (параллельное соединение)
+        if R_time > 0 and R_defects > 0:
+            R_total = 1.0 / (1.0/R_time + 1.0/R_defects)
+        else:
+            R_total = min(R_time, R_defects)
+        
+        # Влияние влажности
+        humidity_factor = 1.0 + 2.0 * (1.0 - humidity)  # Сухой грунт увеличивает сопротивление
+        R_total *= humidity_factor
+        
+        return max(R_total, 0.01)
+    
+    def calculate_effective_resistance(self, phi_surface, T=15.0, humidity=0.8):
+        """
+        Расчет эффективного сопротивления для линеаризации
+        R_eff = dφ/di
+        """
+        # Сопротивление покрытия
+        R_coating = self.calculate_coating_resistance_detailed(self.age_years, humidity)
+        
+        # Электрохимическое сопротивление (производная Батлер-Вольмера)
+        E_eq = -0.65  # Равновесный потенциал стали
+        eta = phi_surface - E_eq
+        
+        i0 = 1e-6 * (humidity ** 0.3)  # Плотность тока обмена
+        F = 96485
+        R_gas = 8.314
+        T_K = T + 273.15
+        
+        if abs(eta) < 1e-6:
+            di_dphi = i0 * 4 * F / (R_gas * T_K)
+        else:
+            alpha = 0.5
+            n = 4
+            di_dphi = i0 * (alpha*n*F/(R_gas*T_K) * np.exp(-alpha*n*F*eta/(R_gas*T_K)) +
+                          (1-alpha)*n*F/(R_gas*T_K) * np.exp((1-alpha)*n*F*eta/(R_gas*T_K)))
+        
+        R_electrochem = 1.0 / max(abs(di_dphi), 1e-6)
+        
+        return R_coating + R_electrochem
+    
+    def get_area(self, domain_width):
+        """Площадь трубы в расчетной области"""
+        pipe_start, pipe_end, pipe_y, pipe_radius = self.get_pipe_segment(domain_width)
+        length_in_domain = pipe_end - pipe_start
+        circumference = 2 * np.pi * pipe_radius
+        return length_in_domain * circumference
+    
+    def get_boundary_condition_parameters(self, T=15.0, humidity=0.8):
+        """
+        Параметры для граничных условий
+        """
+        return {
+            'E_target': -0.85,  # Целевой потенциал защиты
+            'E_eq': -0.65,      # Равновесный потенциал
+            'R_coating': self.calculate_coating_resistance_detailed(self.age_years, humidity),
+            'i0': 1e-6 * (humidity ** 0.3),  # Ток обмена
+            'T': T,
+            'humidity': humidity
+        }

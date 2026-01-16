@@ -129,3 +129,47 @@ class ExtendedAnode:
         y_max = self.y_position + self.width / 2
         
         return x_min, x_max, y_min, y_max
+
+    def calculate_anode_resistance(self, phi_surface=None, T=15.0, humidity=0.8):
+        """
+        Расчет сопротивления анода с учетом деградации и условий
+        """
+        # Базовое сопротивление
+        R_base = 0.05  # Ом·м²
+        
+        # Влияние времени (деградация анода)
+        degradation_factor = 1.0 + 0.1 * self.age_years
+        
+        # Влияние температуры
+        T_ref = 20.0  # °C
+        T_factor = 1.0 + 0.02 * (T - T_ref)
+        
+        # Влияние влажности
+        humidity_factor = 1.0 / max(humidity, 0.1)
+        
+        # Влияние тока (если задан потенциал)
+        if phi_surface is not None:
+            V_app = self.potential / self.efficiency if self.efficiency > 0 else 1.0
+            current_density = (V_app * self.efficiency - phi_surface) / (R_base * degradation_factor)
+            current_factor = 1.0 + 0.5 * min(abs(current_density), 1.0)
+        else:
+            current_factor = 1.0
+        
+        return R_base * degradation_factor * T_factor * humidity_factor * current_factor
+    
+    def get_boundary_condition_parameters(self, V_app, T=15.0, humidity=0.8):
+        """
+        Параметры для граничных условий анода
+        """
+        return {
+            'E_anode': V_app * self.efficiency,
+            'E_eq': 1.2,  # Равновесный потенциал Mg
+            'R_output': self.calculate_anode_resistance(T=T, humidity=humidity),
+            'i0': 1e-4 * (humidity ** 0.5),  # Ток обмена для Mg
+            'T': T,
+            'humidity': humidity
+        }
+    
+    def get_area(self):
+        """Площадь анода"""
+        return self.length * self.width
