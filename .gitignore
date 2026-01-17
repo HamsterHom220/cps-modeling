@@ -5,3 +5,5 @@ dataset/
 test_examples/
 
 *.png
+*.log
+*.tex

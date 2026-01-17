@@ -175,7 +175,7 @@ class SoilModel:
         Returns:
             Функция проводимости с временными эффектами, но ОДНОЙ И ТОЙ ЖЕ структурой
         """
-        print(f"    Getting conductivity for t={t_years} years (same structure)")
+        #print(f"    Getting conductivity for t={t_years} years (same structure)")
         
         # Базовое значение проводимости
         base_conductivity = 0.2
@@ -223,7 +223,7 @@ class SoilModel:
         # Для отладки: сравниваем с предыдущими значениями
         if hasattr(self, 'last_sigma_values'):
             diff = np.mean(np.abs(sigma_values - self.last_sigma_values))
-            print(f"      Mean change from last time: {diff:.6f} S/m")
+            #print(f"      Mean change from last time: {diff:.6f} S/m")
         
         self.last_sigma_values = sigma_values.copy()
 

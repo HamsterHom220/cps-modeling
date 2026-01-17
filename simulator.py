@@ -469,6 +469,12 @@ class CPS_DegradationSimulator:
             # Solve Robin system with current R values
             phi_new = self._solve_robin_linear_system(R_anode, R_pipe, E_anode, E_pipe)
 
+            # Check for NaN/Inf in solution (indicates solver failure)
+            if np.any(np.isnan(phi_new.x.array)) or np.any(np.isinf(phi_new.x.array)):
+                if self.verbose:
+                    print(f"      Error: NaN/Inf detected in solution at iteration {iteration + 1}")
+                break
+
             # Check convergence
             delta = np.max(np.abs(phi_new.x.array - self.phi.x.array))
 
@@ -734,10 +740,38 @@ class CPS_DegradationSimulator:
         solver = PETSc.KSP().create(self.domain.comm)
         solver.setOperators(A)
         solver.setType(PETSc.KSP.Type.CG)
-        solver.setTolerances(rtol=1e-10, max_it=2000)
 
-        solver.solve(b, phi_new.x.petsc_vec)
-        phi_new.x.scatter_forward()
+        # Use HYPRE AMG preconditioner for better convergence
+        pc = solver.getPC()
+        pc.setType(PETSc.PC.Type.HYPRE)
+        pc.setHYPREType("boomeramg")
+
+        # More aggressive tolerances with lower max iterations to prevent freezing
+        # rtol=1e-8 is sufficient for engineering accuracy
+        solver.setTolerances(rtol=1e-8, atol=1e-10, max_it=500)
+
+        # Monitor convergence for debugging if needed
+        # solver.setMonitor(lambda ksp, its, rnorm: None)  # Uncomment to debug
+
+        # Solve with error handling
+        try:
+            solver.solve(b, phi_new.x.petsc_vec)
+            phi_new.x.scatter_forward()
+
+            # Check if solver diverged or hit max iterations
+            reason = solver.getConvergedReason()
+            if reason < 0:
+                if self.verbose:
+                    print(f"      Warning: Linear solver diverged (reason={reason})")
+            elif solver.getIterationNumber() >= 500:
+                if self.verbose:
+                    print(f"      Warning: Linear solver hit max iterations (500)")
+
+        except Exception as e:
+            if self.verbose:
+                print(f"      Error in linear solve: {e}")
+            # Return current best guess
+            phi_new.x.array[:] = self.phi.x.array
 
         return phi_new
 

@@ -323,4 +323,4 @@ class CPS_DatasetGenerator:
 
 if __name__ == "__main__":
     generator = CPS_DatasetGenerator()
-    generator.generate_and_save(num_cases=1) # 10K ~ 1.5 hours, 100K ~ 13 hours
+    generator.generate_and_save(num_cases=1000)
