@@ -11,27 +11,51 @@ from eage import ExtendedAnode
 
 
 class CPS_DegradationSimulator:
+    """
+    Impressed Current Cathodic Protection (ICCP) System Simulator.
+
+    Solves the steady-state potential distribution in soil for pipeline
+    cathodic protection systems using the Finite Element Method (FEM).
+
+    Physics Model:
+        - Laplace equation: div(sigma * grad(phi)) = 0 in soil domain
+        - Robin BC on pipe: sigma * dphi/dn = (phi - E_pipe) / R_pipe
+        - Robin BC on anode: sigma * dphi/dn = (phi - E_anode) / R_anode
+        - Natural BC on domain boundaries: dphi/dn = 0
+
+    Features:
+        - Spatially heterogeneous soil conductivity
+        - Time-dependent material degradation (coating, anode efficiency)
+        - Butler-Volmer electrochemistry (linearized for Robin BC)
+        - Newton iteration for nonlinear convergence
+
+    Usage:
+        sim = CPS_DegradationSimulator()
+        sim.create_mesh_and_function_space()
+        results = sim.solve_with_robin_bc(params, t_years, soil_model)
+    """
+
     def __init__(self, domain_width=20.0, domain_height=8.0, mesh_resolution=(80, 32), verbose=False):
         self.domain_width = domain_width
         self.domain_height = domain_height
         self.mesh_resolution = mesh_resolution
         self.verbose = verbose
-        
-        # Инициализация компонентов системы
+
+        # System components
         self.pipe = Pipe(y_position=4.0)
         self.anode = ExtendedAnode(y_position=1.5)
-        
-        # Физические параметры
+
+        # Time tracking
         self.time_years = 0.0
-        
-        # FEM-объекты
+
+        # FEM objects (initialized in create_mesh_and_function_space)
         self.domain = None
         self.V = None
         self.phi = None
         self.sigma_function = None
 
     def create_mesh_and_function_space(self):
-        """Создание сетки и функционального пространства"""
+        """Create computational mesh and FEM function space."""
         
         self.domain = mesh.create_rectangle(
             MPI.COMM_WORLD,
@@ -40,42 +64,44 @@ class CPS_DegradationSimulator:
             mesh.CellType.triangle
         )
         
-        # Создание функционального пространства для потенциала
+        # Create function space for potential (P1 Lagrange elements)
         self.V = fem.functionspace(self.domain, ("Lagrange", 1))
         self.phi = fem.Function(self.V, name="Potential")
-        
-        # Функция для проводимости грунта
+
+        # Function for soil conductivity (spatially varying)
         self.sigma = fem.Function(self.V, name="Conductivity")
         
         return self.domain, self.V
     
     def setup_soil_model(self, base_params, t_years, soil_model):
-        """Настройка с существующей моделью грунта - ПОПРАВЛЕННАЯ"""
-        # Получаем проводимость из модели грунта
+        """
+        Configure soil conductivity from SoilModel.
+
+        Copies conductivity values from soil_model into the FEM function
+        used by the solver.
+        """
         self.sigma_function = soil_model.get_conductivity(t_years)
 
-        # ВАЖНО: копируем значения в self.sigma, который используется в FEM решателях
         if self.sigma is not None:
             self.sigma.x.array[:] = self.sigma_function.x.array[:]
 
-        # Проверка
         if self.verbose:
             sigma_values = self.sigma.x.array
-            print(f"      Проводимость: min={np.min(sigma_values):.4f}, "
+            print(f"      Conductivity: min={np.min(sigma_values):.4f}, "
                   f"max={np.max(sigma_values):.4f} S/m")
 
         return soil_model
 
     def _calculate_anode_resistance(self, params, T, humidity):
-        """Расчет сопротивления анода - делегирует в класс Anode"""
+        """Calculate anode resistance - delegates to Anode class."""
         return self.anode.calculate_anode_resistance(T=T, humidity=humidity)
 
     def _calculate_pipe_resistance(self, params, T, humidity):
-        """Расчет сопротивления трубы - делегирует в класс Pipe"""
+        """Calculate pipe resistance - delegates to Pipe class."""
         return self.pipe.calculate_effective_resistance(T=T, humidity=humidity)
 
     def _get_boundary_potentials(self):
-        """Получение средних потенциалов на границах"""
+        """Get average potentials at electrode boundaries."""
         anode_dofs = self._get_boundary_dofs('anode')
         pipe_dofs = self._get_boundary_dofs('pipe')
 
@@ -99,18 +125,21 @@ class CPS_DegradationSimulator:
         return 1.2 if boundary_type == 'anode' else -0.85
 
     def _calculate_boundary_currents(self):
-        """Расчет токов на границах"""
+        """
+        Calculate boundary currents using resistance-based approximation.
+
+        For more accurate flux-based calculation, use calculate_boundary_flux().
+        """
         anode_dofs = self._get_boundary_dofs('anode')
         pipe_dofs = self._get_boundary_dofs('pipe')
 
-        # Простая оценка тока на основе градиента потенциала
         if len(anode_dofs) > 0 and len(pipe_dofs) > 0:
             phi_anode = np.mean(self.phi.x.array[anode_dofs])
             phi_pipe = np.mean(self.phi.x.array[pipe_dofs])
             delta_phi = phi_anode - phi_pipe
 
             R_anode = self.anode.calculate_anode_resistance()
-            R_pipe = self.pipe.calculate_effective_resistance()
+            R_pipe = self.pipe.calculate_effective_resistance(phi_pipe)
             R_total = R_anode + R_pipe
 
             if R_total > 0:
@@ -126,8 +155,126 @@ class CPS_DegradationSimulator:
 
         return anode_current, pipe_current
 
+    def calculate_boundary_flux(self, boundary_type='pipe'):
+        """
+        Calculate current flux through boundary using FEM integration.
+
+        Computes: I = ∫ σ ∂φ/∂n ds
+
+        This is the physically correct way to compute boundary currents
+        from the FEM solution, using the normal flux integral.
+
+        Args:
+            boundary_type: 'pipe', 'anode', or 'all'
+
+        Returns:
+            dict with 'total_current' (A/m), 'current_density' (A/m²),
+            'flux_distribution' (array of local flux values)
+        """
+        if not hasattr(self, 'facet_markers') or self.facet_markers is None:
+            self.mark_boundaries()
+
+        results = {}
+
+        # Get boundary ID based on type
+        if boundary_type == 'pipe':
+            boundary_id = 5
+            area = self.pipe.get_area(self.domain_width)
+        elif boundary_type == 'anode':
+            boundary_id = 6
+            area = self.anode.get_area()
+        else:
+            raise ValueError(f"Unknown boundary type: {boundary_type}")
+
+        # Create boundary measure
+        ds_boundary = ufl.Measure("ds", domain=self.domain,
+                                   subdomain_data=self.facet_markers,
+                                   subdomain_id=boundary_id)
+
+        # Compute normal flux: σ ∂φ/∂n
+        # In weak form, this is the natural boundary term from integration by parts
+        # We compute it as: flux = ∫ σ ∇φ · n ds
+
+        n = ufl.FacetNormal(self.domain)
+
+        # Normal flux form: σ * (∇φ · n)
+        flux_form = self.sigma * ufl.inner(ufl.grad(self.phi), n) * ds_boundary
+
+        # Assemble to get total flux (current per unit depth)
+        total_flux = fem.assemble_scalar(fem.form(flux_form))
+
+        # Also compute flux magnitude for statistics
+        # |σ ∇φ| integrated over boundary
+        flux_magnitude_form = ufl.sqrt(ufl.inner(
+            self.sigma * ufl.grad(self.phi),
+            self.sigma * ufl.grad(self.phi)
+        )) * ds_boundary
+
+        try:
+            flux_magnitude = fem.assemble_scalar(fem.form(flux_magnitude_form))
+        except Exception:
+            flux_magnitude = abs(total_flux)
+
+        # Compute area of boundary for current density
+        area_form = fem.Constant(self.domain, default_scalar_type(1.0)) * ds_boundary
+        computed_area = fem.assemble_scalar(fem.form(area_form))
+
+        if computed_area > 0:
+            avg_current_density = total_flux / computed_area
+        else:
+            avg_current_density = 0.0
+
+        results = {
+            'total_current': float(total_flux),  # A/m (per unit depth)
+            'current_density': float(avg_current_density),  # A/m²
+            'flux_magnitude': float(flux_magnitude),
+            'boundary_area': float(computed_area),  # m² per unit depth
+            'boundary_type': boundary_type
+        }
+
+        return results
+
+    def calculate_current_conservation(self):
+        """
+        Check current conservation: sum of all boundary fluxes should be zero.
+
+        For a valid solution, current entering through anode should equal
+        current leaving through pipe (and domain boundaries should have zero flux).
+
+        Returns:
+            dict with flux values and conservation error
+        """
+        anode_flux = self.calculate_boundary_flux('anode')
+        pipe_flux = self.calculate_boundary_flux('pipe')
+
+        # Current should be conserved: I_anode + I_pipe ≈ 0
+        # (positive = current flowing out of domain)
+        total_flux = anode_flux['total_current'] + pipe_flux['total_current']
+        max_flux = max(abs(anode_flux['total_current']),
+                       abs(pipe_flux['total_current']), 1e-10)
+
+        conservation_error = abs(total_flux) / max_flux
+
+        results = {
+            'anode_current': anode_flux['total_current'],
+            'pipe_current': pipe_flux['total_current'],
+            'anode_current_density': anode_flux['current_density'],
+            'pipe_current_density': pipe_flux['current_density'],
+            'net_flux': total_flux,
+            'conservation_error': conservation_error,
+            'is_conserved': conservation_error < 0.1  # 10% tolerance
+        }
+
+        if self.verbose:
+            print(f"      Current conservation check:")
+            print(f"        Anode: {anode_flux['total_current']:.4f} A/m")
+            print(f"        Pipe:  {pipe_flux['total_current']:.4f} A/m")
+            print(f"        Net:   {total_flux:.4f} A/m (error: {conservation_error:.1%})")
+
+        return results
+
     def _calculate_protection_coverage(self, pipe_potential):
-        """Расчет покрытия защиты"""
+        """Calculate protection coverage percentage."""
         if isinstance(pipe_potential, np.ndarray):
             protected = pipe_potential <= -0.85
             coverage = 100.0 * np.sum(protected) / len(pipe_potential)
@@ -136,7 +283,7 @@ class CPS_DegradationSimulator:
         return coverage
 
     def _estimate_corrosion_rate(self, pipe_potential, current_density, T):
-        """Оценка скорости коррозии"""
+        """Estimate corrosion rate from potential and current density."""
         if isinstance(pipe_potential, np.ndarray):
             avg_potential = np.mean(pipe_potential)
         else:
@@ -161,43 +308,52 @@ class CPS_DegradationSimulator:
         return 0.0
 
     def mark_boundaries(self):
-        """Разметка границ расчетной области и создание meshtags"""
-        
-        # Создаем связь граней с ячейками (нужно для exterior_facet_indices)
+        """
+        Mark domain boundaries and create meshtags for boundary conditions.
+
+        Boundary IDs:
+            1 = Left boundary (x=0)
+            2 = Right boundary (x=domain_width)
+            3 = Bottom boundary (y=0, excluding anode)
+            4 = Top boundary (y=domain_height, excluding pipe)
+            5 = Pipe surface
+            6 = Anode surface
+        """
+        # Create facet-to-cell connectivity (required for exterior_facet_indices)
         self.domain.topology.create_connectivity(self.domain.topology.dim-1, self.domain.topology.dim)
-        
-        # Находим все граничные грани
+
+        # Find all boundary facets
         boundary_facets = mesh.exterior_facet_indices(self.domain.topology)
-        
-        # Создаем массив меток
+
+        # Create marker array
         facet_markers = np.zeros(len(boundary_facets), dtype=np.int32)
-        
-        # Получаем координаты центров граней
-        boundary_facet_centroids = mesh.compute_midpoints(self.domain, 
-                                                         self.domain.topology.dim-1, 
+
+        # Get facet midpoint coordinates
+        boundary_facet_centroids = mesh.compute_midpoints(self.domain,
+                                                         self.domain.topology.dim-1,
                                                          boundary_facets)
-        
+
         for i, centroid in enumerate(boundary_facet_centroids):
             x, y = centroid[0], centroid[1]
 
-            # Проверяем, к какой границе принадлежит (pipe и anode имеют приоритет)
+            # Check boundary type (pipe and anode have priority)
             if self._is_on_pipe(np.array([[x], [y]]))[0]:
-                facet_markers[i] = 5  # Труба (on TOP boundary)
+                facet_markers[i] = 5  # Pipe
             elif self._is_on_anode(np.array([[x], [y]]))[0]:
-                facet_markers[i] = 6  # Анод (on BOTTOM boundary)
+                facet_markers[i] = 6  # Anode
             elif np.isclose(x, 0.0):
-                facet_markers[i] = 1  # Левая граница
+                facet_markers[i] = 1  # Left
             elif np.isclose(x, self.domain_width):
-                facet_markers[i] = 2  # Правая граница
+                facet_markers[i] = 2  # Right
             elif np.isclose(y, 0.0):
-                facet_markers[i] = 3  # Нижняя граница (excluding anode)
+                facet_markers[i] = 3  # Bottom
             elif np.isclose(y, self.domain_height):
-                facet_markers[i] = 4  # Верхняя граница (excluding pipe)
-        
-        # Создаем meshtags
-        self.facet_markers = mesh.meshtags(self.domain, 
-                                          self.domain.topology.dim-1, 
-                                          boundary_facets, 
+                facet_markers[i] = 4  # Top
+
+        # Create meshtags
+        self.facet_markers = mesh.meshtags(self.domain,
+                                          self.domain.topology.dim-1,
+                                          boundary_facets,
                                           facet_markers)
         
         return self.facet_markers
@@ -277,7 +433,7 @@ class CPS_DegradationSimulator:
         humidity = degraded_params[5] if len(degraded_params) > 5 else 0.8
 
         # Electrochemical equilibrium potentials
-        E_anode = 1.2   # Mg anode equilibrium [V]
+        E_anode = 1.2   # ICCP anode effective potential [V]
         E_pipe = -0.65  # Steel equilibrium [V]
 
         # 5. INITIAL GUESS
@@ -476,11 +632,24 @@ class CPS_DegradationSimulator:
                 'pipe_points': int(len(pipe_dofs)),
                 'anode_points': int(len(anode_dofs))
             }
-            
+
+            # Add flux-based current calculation if facet markers exist
+            try:
+                if hasattr(self, 'facet_markers') and self.facet_markers is not None:
+                    flux_results = self.calculate_current_conservation()
+                    results['flux_anode_current'] = flux_results['anode_current']
+                    results['flux_pipe_current'] = flux_results['pipe_current']
+                    results['flux_anode_density'] = flux_results['anode_current_density']
+                    results['flux_pipe_density'] = flux_results['pipe_current_density']
+                    results['current_conservation_error'] = flux_results['conservation_error']
+            except Exception as flux_err:
+                if self.verbose:
+                    print(f"      Note: Flux calculation skipped ({flux_err})")
+
             return results
             
         except Exception as e:
-            print(f"      ⚠️  Ошибка в расчете результатов: {e}")
+            print(f"      Warning: Error in results calculation: {e}")
             return self._get_default_results(params)
 
     def _get_default_results(self, params):
@@ -519,7 +688,7 @@ class CPS_DegradationSimulator:
         Args:
             R_anode: Anode resistance [Ohm*m^2]
             R_pipe: Pipe effective resistance [Ohm*m^2]
-            E_anode: Anode equilibrium potential [V] (default 1.2V for Mg)
+            E_anode: ICCP anode effective potential [V]
             E_pipe: Pipe equilibrium potential [V] (default -0.65V for steel)
 
         Returns:
@@ -625,7 +794,7 @@ class CPS_DegradationSimulator:
                 return anode_dofs, pipe_dofs
                 
         except Exception as e:
-            print(f"      ⚠️  Ошибка при поиске DOF: {e}")
+            print(f"      Warning: Error finding boundary DOFs: {e}")
             # Возвращаем пустые списки
             if boundary_type == 'anode':
                 return []
@@ -652,15 +821,16 @@ class CPS_DegradationSimulator:
             base_anode_efficiency, t_years
         )
         
-        # Создание обновленного вектора параметров
+        # Create updated parameter vector
         degraded = base_params.copy()
         degraded[1] = roughness
         degraded[2] = coating_quality
         degraded[6] = t_years
         degraded[7] = anode_efficiency
-        
-        print(f"  t={t_years} лет: покрытие {base_params[2]:.2f}→{coating_quality:.2f}, "
-              f"анод {base_params[7]:.2f}→{anode_efficiency:.2f}") if self.verbose else None
-        
+
+        if self.verbose:
+            print(f"  t={t_years} years: coating {base_params[2]:.2f}->{coating_quality:.2f}, "
+                  f"anode eff {base_params[7]:.2f}->{anode_efficiency:.2f}")
+
         return degraded
     
