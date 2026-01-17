@@ -772,6 +772,11 @@ class CPS_DegradationSimulator:
                 print(f"      Error in linear solve: {e}")
             # Return current best guess
             phi_new.x.array[:] = self.phi.x.array
+        finally:
+            # Explicitly destroy PETSc objects to prevent memory leak
+            solver.destroy()
+            A.destroy()
+            b.destroy()
 
         return phi_new
 

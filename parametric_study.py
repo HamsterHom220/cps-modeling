@@ -11,6 +11,13 @@ from scipy.interpolate import griddata
 from simulator import CPS_DegradationSimulator
 from soil import SoilModel
 
+import shutil
+
+# Before starting large generation
+cache_dir = os.path.expanduser("~/.cache/fenics")
+if os.path.exists(cache_dir):
+    shutil.rmtree(cache_dir)
+
 
 class CPS_DatasetGenerator:
     """Генератор датасета с управлением моделями грунта"""
@@ -159,36 +166,41 @@ class CPS_DatasetGenerator:
         
         sequence_results = []
         
-        # Кэшируем проводимость для каждого времени
+        # Кэшируем проводимость для каждого времени (will be cleaned up at end)
         conductivity_cache = {}
-        
-        for t in time_points:
-            if verbose:
-                print(f"\n  Время: {t} лет")
-            
-            # Получаем проводимость (вычисляем только один раз)
-            if t not in conductivity_cache:
-                sigma_func = soil_model.get_conductivity(t)
-                conductivity_cache[t] = sigma_func.x.array.copy()
-            
-            # Устанавливаем проводимость в симулятор
-            simulator.sigma.x.array[:] = conductivity_cache[t]
-            
-            # Проверка проводимости
-            if verbose:
-                sigma_values = simulator.sigma.x.array
-                print(f"    Проводимость: min={np.min(sigma_values):.4f}, "
-                    f"max={np.max(sigma_values):.4f} S/m")
 
-            # Solve with Robin BC (includes degradation internally)
-            results = simulator.solve_with_robin_bc(base_params, t, soil_model)
-            
-            # Добавляем данные полей для визуализации
-            if results is not None:
-                results['field_data'] = self._generate_field_data(simulator, t)
-                results['time_years'] = t
-                sequence_results.append(results)
-        
+        try:
+            for t in time_points:
+                if verbose:
+                    print(f"\n  Время: {t} лет")
+
+                # Получаем проводимость (вычисляем только один раз)
+                if t not in conductivity_cache:
+                    sigma_func = soil_model.get_conductivity(t)
+                    conductivity_cache[t] = sigma_func.x.array.copy()
+
+                # Устанавливаем проводимость в симулятор
+                simulator.sigma.x.array[:] = conductivity_cache[t]
+
+                # Проверка проводимости
+                if verbose:
+                    sigma_values = simulator.sigma.x.array
+                    print(f"    Проводимость: min={np.min(sigma_values):.4f}, "
+                        f"max={np.max(sigma_values):.4f} S/m")
+
+                # Solve with Robin BC (includes degradation internally)
+                results = simulator.solve_with_robin_bc(base_params, t, soil_model)
+
+                # Добавляем данные полей для визуализации
+                if results is not None:
+                    results['field_data'] = self._generate_field_data(simulator, t)
+                    results['time_years'] = t
+                    sequence_results.append(results)
+        finally:
+            # Cleanup memory for this case
+            del conductivity_cache
+            del simulator
+
         # Сохраняем сводку
         if sequence_results and verbose:
             initial = sequence_results[0]
@@ -288,32 +300,99 @@ class CPS_DatasetGenerator:
         
         print(f"  Сохранено {len(soil_models_data)} моделей грунта в {self.soil_models_file}")
     
+    def save_case_incremental(self, case_idx, base_params, time_sequence):
+        """Incremental saving of a single case to HDF5 (memory-efficient)"""
+        with h5py.File(self.data_file, 'a') as f:
+            # Ensure groups exist
+            if 'parameters' not in f:
+                f.create_group('parameters')
+            if 'results' not in f:
+                f.create_group('results')
+            if 'fields' not in f:
+                f.create_group('fields')
+
+            params_group = f['parameters']
+            results_group = f['results']
+            fields_group = f['fields']
+
+            # Save parameters
+            params_group.create_dataset(f'case_{case_idx:04d}',
+                                      data=np.array(base_params, dtype=np.float32))
+
+            case_group = results_group.create_group(f'case_{case_idx:04d}')
+            case_fields_group = fields_group.create_group(f'case_{case_idx:04d}')
+
+            for time_result in time_sequence:
+                t = int(time_result['time_years'])
+
+                # Save results
+                time_results_group = case_group.create_group(f't_{t:03d}')
+                for key, value in time_result.items():
+                    if key != 'time_years' and key != 'field_data':
+                        time_results_group.attrs[key] = float(value)
+
+                # Save fields
+                if 'field_data' in time_result:
+                    field_data = time_result['field_data']
+                    time_fields_group = case_fields_group.create_group(f't_{t:03d}')
+
+                    time_fields_group.create_dataset('X', data=field_data['X_grid'])
+                    time_fields_group.create_dataset('Y', data=field_data['Y_grid'])
+                    time_fields_group.create_dataset('phi', data=field_data['phi_grid'])
+                    time_fields_group.create_dataset('sigma', data=field_data['sigma_grid'])
+
+                    for key in ['domain_width', 'domain_height', 'pipe_y',
+                              'resolution_x', 'resolution_y', 'pipe_radius',
+                              'pipe_start', 'pipe_end']:
+                        if key in field_data:
+                            time_fields_group.attrs[key] = field_data[key]
+                    time_fields_group.attrs['time_years'] = t
+
     def generate_and_save(self, num_cases=3):
-        """Генерация и сохранение датасета"""
+        """Генерация и сохранение датасета (memory-efficient incremental saving)"""
         print(f"\n{'='*70}")
         print("ГЕНЕРАЦИЯ ДАТАСЕТА С УПРАВЛЕНИЕМ МОДЕЛЯМИ ГРУНТА")
         print(f"{'='*70}")
-        
+
         time_points = [0, 5, 10, 15, 20, 25, 30]
         base_params_list = self.generate_base_parameters(num_cases)
-        
-        all_results = []
-        
+
+        # Remove old HDF5 file if exists
+        if os.path.exists(self.data_file):
+            os.remove(self.data_file)
+
+        # Generate and save incrementally (no memory accumulation)
         for i, base_params in tqdm(enumerate(base_params_list)):
-            # Генерируем данные с привязанной моделью грунта
+            # Generate data for this case
             case_data = self.generate_case_with_soil_model(base_params, i, time_points)
-            all_results.append(case_data)
-        
-        # Сохраняем датасет
-        self.save_dataset(all_results)
-        
-        # Сохраняем модели грунта
+            base_params_result, time_sequence, _ = case_data
+
+            # Save immediately (incremental)
+            self.save_case_incremental(i, base_params_result, time_sequence)
+
+            # Explicitly free memory for this case
+            del case_data, time_sequence
+
+        # Save metadata
+        metadata = {
+            'total_cases': num_cases,
+            'time_points': time_points,
+            'generation_date': datetime.now().isoformat(),
+            'model_type': 'Полноценная физическая модель FEM',
+            'physics': 'Уравнение Лапласа с нелинейными граничными условиями',
+            'soil_models_count': len(self.soil_models_cache),
+            'note': 'Модели грунта сохранены отдельно в soil_models.json'
+        }
+        with open(self.metadata_file, 'w') as f:
+            json.dump(metadata, f, indent=2)
+
+        # Save soil models
         self.save_soil_models()
-        
+
         print(f"\n{'='*70}")
         print("✅ ДАТАСЕТ УСПЕШНО СОЗДАН")
         print(f"{'='*70}")
-        print(f"\nСоздано: {len(all_results)} случаев")
+        print(f"\nСоздано: {num_cases} случаев")
         print(f"Использовано уникальных моделей грунта: {len(self.soil_models_cache)}")
         print(f"\nФайлы:")
         print(f"  Основные данные: {self.data_file}")
