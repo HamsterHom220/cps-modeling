@@ -5,7 +5,7 @@ from mpi4py import MPI
 import ufl
 
 class SoilModel:
-    def __init__(self, domain, params, domain_height, pipe_y, enable_plotting=False, seed=None):
+    def __init__(self, domain, params, domain_height, pipe_y, enable_plotting=False, seed=None, function_space=None):
         self.R_sigma = params[0]
         self.wetness = params[5]
         self.params = params
@@ -13,9 +13,12 @@ class SoilModel:
         self.domain_height = domain_height
         self.pipe_y = pipe_y
         self.plotting = enable_plotting
-        
-        # Пространство функций для проводимости
-        self.V_sigma = fem.functionspace(domain, ("CG", 1))
+
+        # Use provided function space or create new one (prevents memory leak)
+        if function_space is not None:
+            self.V_sigma = function_space
+        else:
+            self.V_sigma = fem.functionspace(domain, ("CG", 1))
         self.sigma = fem.Function(self.V_sigma)
         
         # Seed: если не задан, генерируем из параметров

@@ -38,7 +38,26 @@ class CPS_DatasetGenerator:
             [80, 32],
             mesh.CellType.triangle
         )
-        
+
+        # Create shared function space ONCE (reuse across all cases to prevent memory leak)
+        print("Creating shared function space...")
+        self.shared_V = fem.functionspace(self.shared_domain, ("Lagrange", 1))
+
+        # Create a temporary simulator to generate shared facet markers
+        print("Creating shared boundary markers...")
+        from simulator import CPS_DegradationSimulator
+        temp_sim = CPS_DegradationSimulator(verbose=False)
+        temp_sim.domain = self.shared_domain
+        temp_sim.V = self.shared_V
+        temp_sim.mark_boundaries()  # Create facet markers once
+        self.shared_facet_markers = temp_sim.facet_markers
+        del temp_sim
+
+        # Create shared solution functions (reuse across all cases)
+        print("Creating shared solution functions...")
+        self.shared_phi = fem.Function(self.shared_V, name="Potential")
+        self.shared_sigma = fem.Function(self.shared_V, name="Conductivity")
+
         # Кэш для моделей грунта
         self.soil_models_cache = {}
     
@@ -138,31 +157,39 @@ class CPS_DatasetGenerator:
             print(f"\nГенерация данных для случая {case_idx}...")
             print(f"  V_app: {base_params[4]:.1f} В, Покрытие: {base_params[2]:.2f}")
         
-        # Создаем или получаем модель грунта из кэша
+        # Create fresh soil model for each case (no caching with random parameters)
+        # Caching disabled: with random params, reuse rate is 0% and cache just leaks memory
+        if verbose:
+            print(f"  Создание модели грунта для случая {case_idx}...")
+        soil_model = SoilModel(
+            self.shared_domain, base_params,
+            domain_height=8.0, pipe_y=4.0,
+            enable_plotting=False,
+            function_space=self.shared_V  # Reuse shared function space (prevents leak)
+        )
+
+        # Store metadata for later saving (but not the full model object)
         soil_key = tuple(base_params[:6])
-        
         if soil_key not in self.soil_models_cache:
-            if verbose:
-                print(f"  Создание новой модели грунта для случая {case_idx}...")
-            soil_model = SoilModel(
-                self.shared_domain, base_params, 
-                domain_height=8.0, pipe_y=4.0,
-                enable_plotting=False
-            )
-            self.soil_models_cache[soil_key] = soil_model
-        else:
-            if verbose:
-                print(f"  Использование существующей модели грунта для случая {case_idx}")
-            soil_model = self.soil_models_cache[soil_key]
+            self.soil_models_cache[soil_key] = {
+                'params': base_params,
+                'seed': soil_model.seed,
+                'case_idx': case_idx
+            }
         
         # Создаем симулятор для этого случая
         simulator = CPS_DegradationSimulator(verbose=False)
         simulator.domain = self.shared_domain  # Используем общий домен
-        
-        # Создаем функциональное пространство на общем домене
-        simulator.V = fem.functionspace(self.shared_domain, ("Lagrange", 1))
-        simulator.phi = fem.Function(simulator.V, name="Potential")
-        simulator.sigma = fem.Function(simulator.V, name="Conductivity")
+        simulator.V = self.shared_V  # Reuse shared function space (prevents memory leak)
+        simulator.facet_markers = self.shared_facet_markers  # Reuse shared boundary markers
+
+        # Reuse shared solution functions (just update arrays, don't create new objects)
+        simulator.phi = self.shared_phi
+        simulator.sigma = self.shared_sigma
+
+        # Reset solution arrays for this case
+        simulator.phi.x.array[:] = 0.0
+        simulator.sigma.x.array[:] = 0.0
         
         sequence_results = []
         
@@ -200,6 +227,7 @@ class CPS_DatasetGenerator:
             # Cleanup memory for this case
             del conductivity_cache
             del simulator
+            del soil_model  # Free soil model after use (no longer cached)
 
         # Сохраняем сводку
         if sequence_results and verbose:
@@ -212,8 +240,9 @@ class CPS_DatasetGenerator:
                 f"потенциал={final['avg_potential']:.3f} В")
             if 'coverage' in initial and 'coverage' in final:
                 print(f"    Деградация coverage: {initial['coverage'] - final['coverage']:.1f}%")
-        
-        return (base_params, sequence_results, soil_model.get_state_dict())
+
+        # Note: soil_model has been deleted in finally block (no longer cached)
+        return (base_params, sequence_results, None)
 
     def save_dataset(self, all_results):
         """Сохранение датасета"""
@@ -282,16 +311,15 @@ class CPS_DatasetGenerator:
         print(f"✅ Датсет сохранен: {self.data_file}")
         
     def save_soil_models(self):
-        """Сохранение моделей грунта"""
-        print(f"\n💾 Сохранение моделей грунта...")
-        
+        """Сохранение моделей грунта (metadata only, models not cached)"""
+        print(f"\n💾 Сохранение метаданных моделей грунта...")
+
         soil_models_data = {}
-        for i, (soil_key, soil_model) in enumerate(self.soil_models_cache.items()):
+        for i, (soil_key, metadata) in enumerate(self.soil_models_cache.items()):
             soil_models_data[f"soil_model_{i:04d}"] = {
-                'params': soil_model.params,
-                'seed': soil_model.seed,
-                'base_factors_mean': float(np.mean(soil_model.base_factors)) if hasattr(soil_model, 'base_factors') else 0.0,
-                'base_factors_std': float(np.std(soil_model.base_factors)) if hasattr(soil_model, 'base_factors') else 0.0,
+                'params': metadata['params'],
+                'seed': metadata['seed'],
+                'case_idx': metadata['case_idx'],
                 'key': list(soil_key)
             }
         
@@ -348,21 +376,39 @@ class CPS_DatasetGenerator:
                             time_fields_group.attrs[key] = field_data[key]
                     time_fields_group.attrs['time_years'] = t
 
-    def generate_and_save(self, num_cases=3):
-        """Генерация и сохранение датасета (memory-efficient incremental saving)"""
+            # Force flush to disk (helps reduce memory buffering)
+            f.flush()
+
+    def generate_and_save(self, num_cases=3, batch_size=200, start_from=0):
+        """
+        Генерация и сохранение датасета (memory-efficient incremental saving)
+
+        Args:
+            num_cases: Total number of cases to generate
+            batch_size: Max cases per batch (restart needed after this to prevent OOM)
+            start_from: Case index to start from (for resuming after OOM)
+        """
         print(f"\n{'='*70}")
         print("ГЕНЕРАЦИЯ ДАТАСЕТА С УПРАВЛЕНИЕМ МОДЕЛЯМИ ГРУНТА")
         print(f"{'='*70}")
+        print(f"Total cases: {num_cases}, Batch size: {batch_size}, Starting from: {start_from}")
 
         time_points = [0, 5, 10, 15, 20, 25, 30]
         base_params_list = self.generate_base_parameters(num_cases)
 
-        # Remove old HDF5 file if exists
-        if os.path.exists(self.data_file):
+        # Don't remove HDF5 file if resuming
+        if start_from == 0 and os.path.exists(self.data_file):
             os.remove(self.data_file)
 
+        # Determine end of this batch
+        end_idx = min(start_from + batch_size, num_cases)
+
+        print(f"Processing cases {start_from} to {end_idx-1} (batch of {end_idx-start_from})")
+
         # Generate and save incrementally (no memory accumulation)
-        for i, base_params in tqdm(enumerate(base_params_list)):
+        for i in tqdm(range(start_from, end_idx)):
+            base_params = base_params_list[i]
+
             # Generate data for this case
             case_data = self.generate_case_with_soil_model(base_params, i, time_points)
             base_params_result, time_sequence, _ = case_data
@@ -372,6 +418,13 @@ class CPS_DatasetGenerator:
 
             # Explicitly free memory for this case
             del case_data, time_sequence
+
+        # Check if more batches needed
+        if end_idx < num_cases:
+            print(f"\n⚠️  Batch complete. {num_cases - end_idx} cases remaining.")
+            print(f"    To continue, restart Python and run:")
+            print(f"    generator.generate_and_save(num_cases={num_cases}, batch_size={batch_size}, start_from={end_idx})")
+            return  # Don't save metadata yet
 
         # Save metadata
         metadata = {
@@ -402,4 +455,7 @@ class CPS_DatasetGenerator:
 
 if __name__ == "__main__":
     generator = CPS_DatasetGenerator()
-    generator.generate_and_save(num_cases=1000)
+
+    # Generate in batches of 200 to avoid OOM (30 MB leak per case)
+    # For 1000 cases, this will need 5 batches (restart Python between batches)
+    generator.generate_and_save(num_cases=1000, batch_size=200, start_from=0)
