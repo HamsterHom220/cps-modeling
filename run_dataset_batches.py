@@ -6,71 +6,143 @@ Due to ~30 MB/case memory leak in underlying libraries, generating
 1000 cases requires ~30 GB RAM. This script runs batches of 200 cases
 (~6 GB each) and restarts between batches.
 
+Features:
+- Automatic resume detection (checks HDF5 file for completed cases)
+- Graceful interrupt handling (Ctrl+C saves progress)
+- Progress tracking across batches
+
 Usage:
+    # Start fresh or auto-resume
     python3 run_dataset_batches.py
 
-Or manually resume from a specific batch:
-    python3 run_dataset_batches.py 400  # Start from case 400
+    # Manually specify starting case
+    python3 run_dataset_batches.py 400
+
+    # Change total cases or batch size
+    python3 run_dataset_batches.py --total 5000 --batch 250
 """
 
 import sys
 import subprocess
+import argparse
+import os
 
-# Configuration
-TOTAL_CASES = 1000
-BATCH_SIZE = 200  # Safe for ~8 GB RAM systems
+def get_completed_count(dataset_file='./dataset/cp_dataset_full.h5'):
+    """Check how many cases are already completed."""
+    if not os.path.exists(dataset_file):
+        return 0
 
-def run_batch(start_from=0):
+    try:
+        import h5py
+        with h5py.File(dataset_file, 'r') as f:
+            if 'parameters' in f:
+                return len(f['parameters'].keys())
+    except:
+        pass
+    return 0
+
+def run_batch(total_cases, batch_size, start_from=None):
     """Run a single batch of dataset generation."""
     print(f"\n{'='*70}")
-    print(f"Running batch: cases {start_from} to {start_from + BATCH_SIZE - 1}")
+    if start_from is None:
+        print(f"Running batch with auto-resume")
+    else:
+        print(f"Running batch: cases {start_from} to {start_from + batch_size - 1}")
     print(f"{'='*70}\n")
 
-    # Run parametric_study.py with specific start point
-    code = f"""
+    # Run parametric_study.py with auto-resume
+    if start_from is None:
+        code = f"""
 from parametric_study import CPS_DatasetGenerator
 generator = CPS_DatasetGenerator()
-generator.generate_and_save(num_cases={TOTAL_CASES}, batch_size={BATCH_SIZE}, start_from={start_from})
+generator.generate_and_save(num_cases={total_cases}, batch_size={batch_size})
+"""
+    else:
+        code = f"""
+from parametric_study import CPS_DatasetGenerator
+generator = CPS_DatasetGenerator()
+generator.generate_and_save(num_cases={total_cases}, batch_size={batch_size}, start_from={start_from})
 """
 
     # Execute in fresh Python process (clears memory)
     result = subprocess.run([sys.executable, '-c', code], cwd='/home/hhom220/thesis')
 
-    if result.returncode != 0:
+    # Exit codes: 0 = success, 1 = Ctrl+C (graceful), 2+ = error
+    if result.returncode == 0:
+        return True
+    elif result.returncode == 1:
+        print(f"\n⚠️  Interrupted by user. Progress saved.")
+        return True  # Graceful shutdown, can resume
+    else:
         print(f"\n❌ Batch failed with exit code {result.returncode}")
         return False
 
-    return True
-
 def main():
-    # Check if user specified starting point
-    if len(sys.argv) > 1:
-        start_from = int(sys.argv[1])
-    else:
+    parser = argparse.ArgumentParser(description='Generate dataset in batches')
+    parser.add_argument('start_from', nargs='?', type=int, default=None,
+                       help='Case index to start from (auto-detect if not specified)')
+    parser.add_argument('--total', type=int, default=1000,
+                       help='Total number of cases to generate (default: 1000)')
+    parser.add_argument('--batch', type=int, default=200,
+                       help='Batch size (default: 200)')
+
+    args = parser.parse_args()
+
+    total_cases = args.total
+    batch_size = args.batch
+    start_from = args.start_from
+
+    # Check current progress
+    completed = get_completed_count()
+    if completed > 0:
+        print(f"📁 Found existing dataset with {completed} completed cases")
+
+    # Auto-detect start if not specified
+    if start_from is None and completed > 0:
+        start_from = (completed // batch_size) * batch_size
+        print(f"   Auto-resuming from case {start_from}")
+    elif start_from is None:
         start_from = 0
 
     # Run batches
     current = start_from
-    batch_num = (start_from // BATCH_SIZE) + 1
-    total_batches = (TOTAL_CASES + BATCH_SIZE - 1) // BATCH_SIZE
+    total_batches = (total_cases + batch_size - 1) // batch_size
 
-    while current < TOTAL_CASES:
+    while current < total_cases:
+        batch_num = (current // batch_size) + 1
+
         print(f"\n{'#'*70}")
         print(f"#  BATCH {batch_num}/{total_batches}")
+        print(f"#  Progress: {completed}/{total_cases} cases ({100*completed//total_cases}%)")
         print(f"{'#'*70}")
 
-        if not run_batch(current):
-            print(f"\n⚠️  Batch {batch_num} failed. Resume with:")
-            print(f"    python3 run_dataset_batches.py {current}")
-            sys.exit(1)
+        prev_completed = get_completed_count()
 
-        current += BATCH_SIZE
-        batch_num += 1
+        if not run_batch(total_cases, batch_size, current):
+            new_completed = get_completed_count()
+            print(f"\n⚠️  Batch {batch_num} interrupted.")
+            print(f"    Completed: {new_completed}/{total_cases} cases")
+            print(f"    To resume, run:")
+            print(f"    python3 run_dataset_batches.py")
+            sys.exit(0)  # Graceful exit for resume
 
+        # Update progress
+        completed = get_completed_count()
+        new_cases = completed - prev_completed
+        print(f"\n✅ Batch {batch_num} complete: +{new_cases} cases")
+
+        # Check if we're done
+        if completed >= total_cases:
+            break
+
+        current += batch_size
+
+    # Final summary
+    final_count = get_completed_count()
     print(f"\n{'='*70}")
-    print("✅ ALL BATCHES COMPLETE!")
+    print("✅ DATASET GENERATION COMPLETE!")
     print(f"{'='*70}")
-    print(f"Generated {TOTAL_CASES} cases in {total_batches} batches")
+    print(f"Total cases: {final_count}/{total_cases}")
     print(f"Dataset saved to: ./dataset/cp_dataset_full.h5")
 
 if __name__ == "__main__":

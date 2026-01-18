@@ -2,6 +2,8 @@ import numpy as np
 import json
 import os
 import h5py
+import signal
+import sys
 from datetime import datetime
 from dolfinx import mesh, fem
 from mpi4py import MPI
@@ -10,6 +12,23 @@ from scipy.interpolate import griddata
 
 from simulator import CPS_DegradationSimulator
 from soil import SoilModel
+
+# Global flag for graceful shutdown
+_shutdown_requested = False
+
+def signal_handler(signum, frame):
+    """Handle Ctrl+C gracefully"""
+    global _shutdown_requested
+    if not _shutdown_requested:
+        print("\n\n⚠️  Interrupt received. Finishing current case and saving...")
+        print("    Press Ctrl+C again to force quit (may lose current case)")
+        _shutdown_requested = True
+    else:
+        print("\n❌ Force quit. Current case may be incomplete.")
+        sys.exit(1)
+
+# Register signal handler
+signal.signal(signal.SIGINT, signal_handler)
 
 import shutil
 
@@ -328,8 +347,36 @@ class CPS_DatasetGenerator:
         
         print(f"  Сохранено {len(soil_models_data)} моделей грунта в {self.soil_models_file}")
     
+    def get_completed_cases(self):
+        """
+        Check which cases are already completed in the HDF5 file.
+
+        Returns:
+            set: Set of completed case indices
+        """
+        if not os.path.exists(self.data_file):
+            return set()
+
+        completed = set()
+        try:
+            with h5py.File(self.data_file, 'r') as f:
+                if 'parameters' in f:
+                    for case_name in f['parameters'].keys():
+                        # Extract case index from 'case_0000' format
+                        case_idx = int(case_name.split('_')[1])
+                        completed.add(case_idx)
+        except Exception as e:
+            print(f"Warning: Error reading HDF5 file for resume detection: {e}")
+            return set()
+
+        return completed
+
     def save_case_incremental(self, case_idx, base_params, time_sequence):
-        """Incremental saving of a single case to HDF5 (memory-efficient)"""
+        """
+        Incremental saving of a single case to HDF5 (memory-efficient).
+
+        If the case already exists, it will be overwritten (handles resume after partial save).
+        """
         with h5py.File(self.data_file, 'a') as f:
             # Ensure groups exist
             if 'parameters' not in f:
@@ -343,12 +390,21 @@ class CPS_DatasetGenerator:
             results_group = f['results']
             fields_group = f['fields']
 
-            # Save parameters
-            params_group.create_dataset(f'case_{case_idx:04d}',
-                                      data=np.array(base_params, dtype=np.float32))
+            case_name = f'case_{case_idx:04d}'
 
-            case_group = results_group.create_group(f'case_{case_idx:04d}')
-            case_fields_group = fields_group.create_group(f'case_{case_idx:04d}')
+            # Remove existing case if present (handles resume after interruption)
+            if case_name in params_group:
+                del params_group[case_name]
+            if case_name in results_group:
+                del results_group[case_name]
+            if case_name in fields_group:
+                del fields_group[case_name]
+
+            # Save parameters
+            params_group.create_dataset(case_name, data=np.array(base_params, dtype=np.float32))
+
+            case_group = results_group.create_group(case_name)
+            case_fields_group = fields_group.create_group(case_name)
 
             for time_result in time_sequence:
                 t = int(time_result['time_years'])
@@ -379,34 +435,67 @@ class CPS_DatasetGenerator:
             # Force flush to disk (helps reduce memory buffering)
             f.flush()
 
-    def generate_and_save(self, num_cases=3, batch_size=200, start_from=0):
+    def generate_and_save(self, num_cases=3, batch_size=200, start_from=None, auto_resume=True):
         """
         Генерация и сохранение датасета (memory-efficient incremental saving)
 
         Args:
             num_cases: Total number of cases to generate
             batch_size: Max cases per batch (restart needed after this to prevent OOM)
-            start_from: Case index to start from (for resuming after OOM)
+            start_from: Case index to start from (None = auto-detect from HDF5 file)
+            auto_resume: If True, automatically skip completed cases
         """
+        global _shutdown_requested
+        _shutdown_requested = False
+
         print(f"\n{'='*70}")
         print("ГЕНЕРАЦИЯ ДАТАСЕТА С УПРАВЛЕНИЕМ МОДЕЛЯМИ ГРУНТА")
         print(f"{'='*70}")
-        print(f"Total cases: {num_cases}, Batch size: {batch_size}, Starting from: {start_from}")
 
         time_points = [0, 5, 10, 15, 20, 25, 30]
         base_params_list = self.generate_base_parameters(num_cases)
 
-        # Don't remove HDF5 file if resuming
-        if start_from == 0 and os.path.exists(self.data_file):
+        # Auto-detect resume point if not specified
+        completed_cases = self.get_completed_cases() if auto_resume else set()
+
+        if start_from is None:
+            if completed_cases:
+                start_from = max(completed_cases) + 1
+                print(f"📁 Found existing dataset with {len(completed_cases)} cases")
+                print(f"   Auto-resuming from case {start_from}")
+            else:
+                start_from = 0
+                print("   Starting fresh dataset")
+
+        if start_from == 0 and not completed_cases and os.path.exists(self.data_file):
+            print("   Removing old dataset file")
             os.remove(self.data_file)
 
         # Determine end of this batch
         end_idx = min(start_from + batch_size, num_cases)
 
+        print(f"Total cases: {num_cases}, Batch size: {batch_size}")
         print(f"Processing cases {start_from} to {end_idx-1} (batch of {end_idx-start_from})")
+        if completed_cases:
+            print(f"Skipping {len([i for i in range(start_from, end_idx) if i in completed_cases])} already completed cases in this batch")
+        print()
 
         # Generate and save incrementally (no memory accumulation)
-        for i in tqdm(range(start_from, end_idx)):
+        cases_generated = 0
+        for i in tqdm(range(start_from, end_idx), desc="Generating cases"):
+            # Check for graceful shutdown
+            if _shutdown_requested:
+                print(f"\n\n💾 Graceful shutdown at case {i}")
+                print(f"   Generated {cases_generated} new cases in this session")
+                print(f"   Total cases in dataset: {len(self.get_completed_cases())}")
+                print(f"\n   To resume, run:")
+                print(f"   generator.generate_and_save(num_cases={num_cases}, batch_size={batch_size})")
+                return
+
+            # Skip if already completed
+            if auto_resume and i in completed_cases:
+                continue
+
             base_params = base_params_list[i]
 
             # Generate data for this case
@@ -415,9 +504,12 @@ class CPS_DatasetGenerator:
 
             # Save immediately (incremental)
             self.save_case_incremental(i, base_params_result, time_sequence)
+            cases_generated += 1
 
             # Explicitly free memory for this case
             del case_data, time_sequence
+
+        print(f"\n✅ Batch complete! Generated {cases_generated} new cases")
 
         # Check if more batches needed
         if end_idx < num_cases:
@@ -457,5 +549,6 @@ if __name__ == "__main__":
     generator = CPS_DatasetGenerator()
 
     # Generate in batches of 200 to avoid OOM (30 MB leak per case)
-    # For 1000 cases, this will need 5 batches (restart Python between batches)
-    generator.generate_and_save(num_cases=1000, batch_size=200, start_from=0)
+    # Auto-resumes from where it left off (checks HDF5 file)
+    # Use Ctrl+C to interrupt gracefully (waits for current case to finish)
+    generator.generate_and_save(num_cases=1000, batch_size=200)
