@@ -1,0 +1,144 @@
+# PINN Training Configuration
+# Default configuration for Cathodic Protection System PINN
+
+# =============================================================================
+# Data Configuration
+# =============================================================================
+data:
+  h5_path: "/home/hhom220/thesis/dataset/cp_dataset_full-10000.h5"
+  batch_size: 64
+  train_ratio: 0.8
+  val_ratio: 0.1
+  num_workers: 4
+  preload: false  # Set true if you have enough RAM (~16GB)
+  normalize: true
+  seed: 42
+
+# =============================================================================
+# Model Architecture
+# =============================================================================
+model:
+  # Parameter encoder: [8 → 64 → 128 → 256 → 128]
+  param_input_dim: 8
+  param_hidden_dims: [64, 128, 256]
+  param_output_dim: 128
+
+  # Coordinate encoder: Fourier features + MLP
+  coord_input_dim: 2
+  num_fourier_features: 128
+  fourier_sigma: 4.0
+  coord_hidden_dims: [128, 256]
+  coord_output_dim: 128
+
+  # Time encoder: Positional encoding + MLP
+  time_num_frequencies: 8
+  time_hidden_dims: [32]
+  time_output_dim: 64
+
+  # Fusion network: [320 → 256 → 256 → 128]
+  fusion_hidden_dims: [256, 256]
+  fusion_output_dim: 128
+  fusion_use_skip: true
+
+  # Output heads
+  field_hidden_dim: 64
+  scalar_hidden_dims: [128, 64]
+  num_scalars: 26
+
+  # General
+  activation: "gelu"
+  dropout: 0.0
+
+# =============================================================================
+# Loss Function
+# =============================================================================
+loss:
+  lambda_data: 1.0
+  lambda_pde: 0.1
+  lambda_bc: 0.5
+  lambda_scalar: 0.1
+  use_relative_data_loss: true
+  use_variable_sigma: true
+  adaptive_weighting: false
+
+# =============================================================================
+# Training Configuration
+# =============================================================================
+training:
+  max_epochs: 150
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+  grad_clip: 1.0
+  use_amp: false  # Disabled: AMP (float16) causes NaN with autograd second derivatives in PDE loss
+  compute_physics_loss: true
+
+  # Intervals
+  log_interval: 10
+  val_interval: 1
+  save_interval: 10
+  early_stopping_patience: 20
+
+# =============================================================================
+# Curriculum Learning
+# =============================================================================
+curriculum:
+  interpolation: "linear"  # "linear" or "cosine"
+  verbose: true
+  phases:
+    - name: "Data Only"
+      start_epoch: 1
+      end_epoch: 20
+      lambda_data: 1.0
+      lambda_pde: 0.0
+      lambda_bc: 0.0
+      lambda_scalar: 0.1
+      lr_scale: 1.0
+
+    - name: "Physics Ramp-Up"
+      start_epoch: 21
+      end_epoch: 50
+      lambda_data: 1.0
+      lambda_pde: 0.1
+      lambda_bc: 0.5
+      lambda_scalar: 0.1
+      lr_scale: 1.0
+
+    - name: "Full Physics"
+      start_epoch: 51
+      end_epoch: 100
+      lambda_data: 1.0
+      lambda_pde: 0.1
+      lambda_bc: 0.5
+      lambda_scalar: 0.1
+      lr_scale: 0.5
+
+    - name: "Refinement"
+      start_epoch: 101
+      end_epoch: 150
+      lambda_data: 1.0
+      lambda_pde: 0.1
+      lambda_bc: 0.5
+      lambda_scalar: 0.1
+      lr_scale: 0.1
+
+# =============================================================================
+# Output Configuration
+# =============================================================================
+output:
+  checkpoint_dir: "./experiments/pinn_run"
+  save_best: true
+  save_history: true
+
+# =============================================================================
+# Device Configuration
+# =============================================================================
+device: "cuda"  # "cuda" or "cpu"
+
+# =============================================================================
+# Experiment Tracking (optional)
+# =============================================================================
+experiment:
+  name: "pinn_default"
+  tags: ["pinn", "cathodic_protection"]
+  notes: "Default PINN training run"
