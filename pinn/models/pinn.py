@@ -40,17 +40,15 @@ class PINN(nn.Module):
     - Outputs both potential field and scalar metrics
     """
 
-    # Scalar metric names (in order)
+    # Scalar metric names (in order, matching HDF5 dataset)
     SCALAR_NAMES = [
-        'coverage', 'avg_potential', 'min_potential', 'max_potential',
-        'current', 'current_density', 'corrosion_rate',
-        'anode_resistance', 'pipe_resistance', 'coating_resistance',
-        'voltage_drop', 'polarization_loss', 'soil_drop',
-        'protection_current', 'protection_density',
-        'anodic_current', 'cathodic_current',
-        'total_anode_current', 'avg_anode_potential',
-        'flux_anode', 'flux_pipe', 'flux_balance',
-        'newton_iterations', 'newton_converged', 'residual_norm'
+        'V_app', 'anode_efficiency', 'anode_points', 'anode_potential',
+        'anode_resistance', 'avg_potential', 'coating_quality', 'coating_resistance',
+        'corrosion_rate', 'coverage', 'current', 'current_conservation_error',
+        'current_density', 'flux_anode_current', 'flux_anode_density',
+        'flux_pipe_current', 'flux_pipe_density', 'max_potential', 'min_potential',
+        'newton_converged', 'newton_iterations', 'pipe_points', 'pipe_resistance',
+        'soil_resistivity', 'std_potential', 'voltage_drop'
     ]
 
     def __init__(
@@ -77,7 +75,7 @@ class PINN(nn.Module):
         field_hidden_dim: int = 64,
         # Scalar head
         scalar_hidden_dims: List[int] = [128, 64],
-        num_scalars: int = 25,
+        num_scalars: int = 26,
         # General
         activation: str = 'gelu',
         dropout: float = 0.0
@@ -418,7 +416,7 @@ def create_default_pinn(device: str = 'cpu') -> PINN:
         field_hidden_dim=64,
         # Scalar head: [128 → 128 → 64 → 25]
         scalar_hidden_dims=[128, 64],
-        num_scalars=25,
+        num_scalars=26,
         # General
         activation='gelu',
         dropout=0.0

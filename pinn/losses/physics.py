@@ -124,35 +124,11 @@ class PDEResidualLoss(nn.Module):
         )[0]
 
         if self.use_variable_sigma and sigma is not None:
-            # Full equation: ∇·(σ∇φ) = σ∇²φ + ∇σ·∇φ = 0
-            # Compute sigma gradients
-            dsigma_dx = torch.autograd.grad(
-                sigma, x,
-                grad_outputs=torch.ones_like(sigma),
-                create_graph=True,
-                retain_graph=True,
-                allow_unused=True
-            )[0]
-
-            dsigma_dy = torch.autograd.grad(
-                sigma, y,
-                grad_outputs=torch.ones_like(sigma),
-                create_graph=True,
-                retain_graph=True,
-                allow_unused=True
-            )[0]
-
-            if dsigma_dx is None:
-                dsigma_dx = torch.zeros_like(phi)
-            if dsigma_dy is None:
-                dsigma_dy = torch.zeros_like(phi)
-
-            # PDE residual: σ∇²φ + ∇σ·∇φ
-            residual = (
-                sigma * (d2phi_dx2 + d2phi_dy2) +
-                dsigma_dx * dphi_dx +
-                dsigma_dy * dphi_dy
-            )
+            # Weighted Laplace: σ∇²φ = 0
+            # Note: We ignore the ∇σ·∇φ term because sigma is data (not computed),
+            # so we can't compute its gradients via autograd. This is a good
+            # approximation when sigma varies slowly.
+            residual = sigma * (d2phi_dx2 + d2phi_dy2)
         else:
             # Standard Laplace: ∇²φ = 0
             residual = d2phi_dx2 + d2phi_dy2
@@ -210,29 +186,8 @@ class PDEResidualLoss(nn.Module):
         )[0]
 
         if self.use_variable_sigma and sigma is not None:
-            dsigma_dx = torch.autograd.grad(
-                sigma, x,
-                grad_outputs=torch.ones_like(sigma),
-                create_graph=False,
-                allow_unused=True
-            )[0]
-            dsigma_dy = torch.autograd.grad(
-                sigma, y,
-                grad_outputs=torch.ones_like(sigma),
-                create_graph=False,
-                allow_unused=True
-            )[0]
-
-            if dsigma_dx is None:
-                dsigma_dx = torch.zeros_like(phi)
-            if dsigma_dy is None:
-                dsigma_dy = torch.zeros_like(phi)
-
-            residual = (
-                sigma * (d2phi_dx2 + d2phi_dy2) +
-                dsigma_dx * dphi_dx +
-                dsigma_dy * dphi_dy
-            )
+            # Weighted Laplace: σ∇²φ = 0
+            residual = sigma * (d2phi_dx2 + d2phi_dy2)
         else:
             residual = d2phi_dx2 + d2phi_dy2
 

@@ -30,17 +30,18 @@ class CPDataset(Dataset):
     TIME_POINTS = [0, 5, 10, 15, 20, 25, 30]  # years
     GRID_SHAPE = (20, 40)  # (ny, nx)
 
-    # Key scalar metrics to include
+    # Key scalar metrics to include (must match HDF5 file)
     SCALAR_METRICS = [
-        'coverage', 'avg_potential', 'min_potential', 'max_potential',
+        'coverage', 'avg_potential', 'min_potential', 'max_potential', 'std_potential',
         'current', 'current_density', 'corrosion_rate',
         'anode_resistance', 'pipe_resistance', 'coating_resistance',
-        'voltage_drop', 'polarization_loss', 'soil_drop',
-        'protection_current', 'protection_density',
-        'anodic_current', 'cathodic_current',
-        'total_anode_current', 'avg_anode_potential',
-        'flux_anode', 'flux_pipe', 'flux_balance',
-        'newton_iterations', 'newton_converged', 'residual_norm'
+        'voltage_drop', 'anode_potential',
+        'flux_anode_current', 'flux_anode_density',
+        'flux_pipe_current', 'flux_pipe_density',
+        'current_conservation_error',
+        'newton_iterations', 'newton_converged',
+        'V_app', 'anode_efficiency', 'coating_quality', 'soil_resistivity',
+        'anode_points', 'pipe_points'
     ]
 
     def __init__(
@@ -115,14 +116,14 @@ class CPDataset(Dataset):
         y = np.linspace(0, 8, ny)
         xx, yy = np.meshgrid(x, y)
 
-        # Store as tensors
+        # Store as tensors (always on CPU for dataset)
         self.x_grid = torch.tensor(xx, dtype=torch.float32)
         self.y_grid = torch.tensor(yy, dtype=torch.float32)
 
-        # Normalized coordinates
-        x_norm, y_norm = self.normalizer.normalize_coords(self.x_grid, self.y_grid)
-        self.x_grid_norm = x_norm
-        self.y_grid_norm = y_norm
+        # Normalized coordinates (compute on CPU using known ranges)
+        # Domain: x in [0, 20], y in [0, 8]
+        self.x_grid_norm = self.x_grid / 20.0
+        self.y_grid_norm = self.y_grid / 8.0
 
         # Flattened coordinates for point-wise queries
         self.coords_flat = torch.stack([
@@ -190,7 +191,9 @@ class CPDataset(Dataset):
 
     def _get_time_key(self, t_idx: int) -> str:
         """Get HDF5 key for time index."""
-        return f't_{t_idx:03d}'
+        # Time keys use actual time values: t_000, t_005, t_010, etc.
+        t_value = self.TIME_POINTS[t_idx]
+        return f't_{t_value:03d}'
 
     def _snapshot_to_case_time(self, snapshot_idx: int) -> Tuple[int, int]:
         """Convert snapshot index to (case_index, time_index)."""
@@ -433,22 +436,22 @@ def create_data_loaders(
 
     print(f"Dataset split: {len(train_indices)} train, {len(val_indices)} val, {len(test_indices)} test cases")
 
-    # Create normalizer if not provided
+    # Create normalizer if not provided (always on CPU for dataset operations)
     if normalizer is None:
-        normalizer = Normalizer(device=device)
+        normalizer = Normalizer(device='cpu')
 
-    # Create datasets
+    # Create datasets (always use CPU for data loading)
     train_dataset = CPDataset(
         h5_path, case_indices=train_indices, normalizer=normalizer,
-        normalize=normalize, mode=mode, preload=preload, device=device
+        normalize=normalize, mode=mode, preload=preload, device='cpu'
     )
     val_dataset = CPDataset(
         h5_path, case_indices=val_indices, normalizer=normalizer,
-        normalize=normalize, mode=mode, preload=preload, device=device
+        normalize=normalize, mode=mode, preload=preload, device='cpu'
     )
     test_dataset = CPDataset(
         h5_path, case_indices=test_indices, normalizer=normalizer,
-        normalize=normalize, mode=mode, preload=preload, device=device
+        normalize=normalize, mode=mode, preload=preload, device='cpu'
     )
 
     # Create data loaders
