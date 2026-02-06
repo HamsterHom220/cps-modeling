@@ -6,3 +6,6 @@ test_examples/
 
 *.png
 *.log
+
+docs/
+experiments/

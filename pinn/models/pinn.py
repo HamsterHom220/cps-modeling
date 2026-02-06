@@ -380,7 +380,7 @@ class PINN(nn.Module):
     @classmethod
     def load(cls, path: str, map_location: str = 'cpu') -> 'PINN':
         """Load model from checkpoint."""
-        checkpoint = torch.load(path, map_location=map_location)
+        checkpoint = torch.load(path, map_location=map_location, weights_only=False)
         model = cls.from_config(checkpoint['config'])
         model.load_state_dict(checkpoint['state_dict'])
         return model

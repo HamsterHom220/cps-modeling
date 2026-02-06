@@ -84,12 +84,19 @@ class DataLoss(nn.Module):
 class ScalarLoss(nn.Module):
     """
     Loss for scalar metric predictions.
+
+    Uses normalized MSE to handle metrics with different scales:
+    L = mean( (pred - target)^2 / (target^2 + eps) )
+
+    This ensures each metric contributes equally regardless of magnitude.
     """
 
     def __init__(
         self,
         reduction: str = 'mean',
-        weights: Optional[Dict[str, float]] = None
+        weights: Optional[Dict[str, float]] = None,
+        use_relative: bool = True,
+        eps: float = 1e-6
     ):
         """
         Initialize scalar loss.
@@ -97,10 +104,14 @@ class ScalarLoss(nn.Module):
         Args:
             reduction: 'mean' or 'sum'
             weights: Optional per-metric weights
+            use_relative: Use relative error (normalized by target magnitude)
+            eps: Small constant to avoid division by zero
         """
         super().__init__()
         self.reduction = reduction
         self.weights = weights
+        self.use_relative = use_relative
+        self.eps = eps
 
     def forward(
         self,
@@ -120,6 +131,12 @@ class ScalarLoss(nn.Module):
             Scalar loss
         """
         sq_error = (pred - target) ** 2
+
+        if self.use_relative:
+            # Normalize by target magnitude per metric (across batch)
+            # Use mean of squared targets per metric as scale
+            target_scale = target.abs().mean(dim=0, keepdim=True).clamp(min=self.eps) ** 2
+            sq_error = sq_error / target_scale
 
         if self.weights is not None and metric_names is not None:
             # Apply per-metric weights
@@ -250,7 +267,7 @@ class CombinedLoss(nn.Module):
         self.data_loss = DataLoss(use_relative=use_relative_data_loss)
         self.pde_loss = PDEResidualLoss(use_variable_sigma=use_variable_sigma)
         self.bc_loss = BoundaryConditionLoss()
-        self.scalar_loss = ScalarLoss(weights=scalar_weights)
+        self.scalar_loss = ScalarLoss(weights=scalar_weights, use_relative=True)
 
         # Adaptive weighting
         self.adaptive_weighting = adaptive_weighting

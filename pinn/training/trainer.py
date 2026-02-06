@@ -369,17 +369,22 @@ class Trainer:
         Returns:
             Training history
         """
+        # Determine starting epoch (for resuming from checkpoint)
+        start_epoch = self.current_epoch + 1 if self.current_epoch > 0 else 1
+
         print(f"\n{'='*60}")
         print(f"Starting PINN Training")
         print(f"Device: {self.device}")
         print(f"Model parameters: {self.model.count_parameters():,}")
         print(f"Training samples: {len(self.train_loader.dataset)}")
         print(f"Validation samples: {len(self.val_loader.dataset)}")
+        if start_epoch > 1:
+            print(f"Resuming from epoch {start_epoch}")
         print(f"{'='*60}\n")
 
         start_time = time.time()
 
-        for epoch in range(1, self.max_epochs + 1):
+        for epoch in range(start_epoch, self.max_epochs + 1):
             self.current_epoch = epoch
             epoch_start = time.time()
 
@@ -460,13 +465,14 @@ class Trainer:
             'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
             'curriculum_state_dict': self.curriculum.state_dict(),
             'best_val_loss': self.best_val_loss,
+            'epochs_without_improvement': self.epochs_without_improvement,
             'normalizer_state_dict': self.normalizer.state_dict(),
             'history': self.history
         }, path)
 
     def load_checkpoint(self, path: str):
         """Load training checkpoint."""
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
 
         self.current_epoch = checkpoint['epoch']
         self.global_step = checkpoint['global_step']
@@ -478,9 +484,11 @@ class Trainer:
 
         self.curriculum.load_state_dict(checkpoint['curriculum_state_dict'])
         self.best_val_loss = checkpoint['best_val_loss']
+        self.epochs_without_improvement = checkpoint.get('epochs_without_improvement', 0)
         self.history = checkpoint.get('history', self.history)
 
         print(f"Loaded checkpoint from epoch {self.current_epoch}")
+        print(f"Best validation loss: {self.best_val_loss:.4f}")
 
     def save_history(self):
         """Save training history to JSON."""

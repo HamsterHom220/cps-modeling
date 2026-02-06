@@ -1,0 +1,137 @@
+# PINN Training Configuration - Improved
+# Optimized configuration based on initial training analysis
+
+# =============================================================================
+# Data Configuration
+# =============================================================================
+data:
+  h5_path: "/home/hhom220/thesis/dataset/cp_dataset_full-10000.h5"
+  batch_size: 64
+  train_ratio: 0.8
+  val_ratio: 0.1
+  num_workers: 4
+  preload: false
+  normalize: true
+  seed: 42
+
+# =============================================================================
+# Model Architecture (unchanged from default)
+# =============================================================================
+model:
+  param_input_dim: 8
+  param_hidden_dims: [64, 128, 256]
+  param_output_dim: 128
+  coord_input_dim: 2
+  num_fourier_features: 128
+  fourier_sigma: 4.0
+  coord_hidden_dims: [128, 256]
+  coord_output_dim: 128
+  time_num_frequencies: 8
+  time_hidden_dims: [32]
+  time_output_dim: 64
+  fusion_hidden_dims: [256, 256]
+  fusion_output_dim: 128
+  fusion_use_skip: true
+  field_hidden_dim: 64
+  scalar_hidden_dims: [128, 64]
+  num_scalars: 26
+  activation: "gelu"
+  dropout: 0.0
+
+# =============================================================================
+# Loss Function - Adjusted weights
+# =============================================================================
+loss:
+  lambda_data: 1.0
+  lambda_pde: 0.05       # Reduced: physics is regularization, not main objective
+  lambda_bc: 0.1         # Reduced
+  lambda_scalar: 0.5     # Increased: now uses relative error, contributes equally
+  use_relative_data_loss: true
+  use_variable_sigma: true
+  adaptive_weighting: false
+
+# =============================================================================
+# Training Configuration - More conservative
+# =============================================================================
+training:
+  max_epochs: 200        # More epochs for convergence
+  learning_rate: 0.0005  # Lower LR for stability
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+  grad_clip: 1.0
+  use_amp: false         # Disabled: causes NaN with autograd second derivatives
+  compute_physics_loss: true
+
+  # Intervals
+  log_interval: 10
+  val_interval: 1
+  save_interval: 20
+  early_stopping_patience: 30  # Longer patience
+
+# =============================================================================
+# Curriculum Learning - Extended phases
+# =============================================================================
+curriculum:
+  interpolation: "cosine"  # Smoother transitions
+  verbose: true
+  phases:
+    # Phase 1: Learn basic field mapping
+    - name: "Data Only"
+      start_epoch: 1
+      end_epoch: 30        # Extended
+      lambda_data: 1.0
+      lambda_pde: 0.0
+      lambda_bc: 0.0
+      lambda_scalar: 0.5
+      lr_scale: 1.0
+
+    # Phase 2: Gradually introduce physics
+    - name: "Physics Ramp-Up"
+      start_epoch: 31
+      end_epoch: 80        # Extended
+      lambda_data: 1.0
+      lambda_pde: 0.05
+      lambda_bc: 0.1
+      lambda_scalar: 0.5
+      lr_scale: 1.0
+
+    # Phase 3: Full physics training
+    - name: "Full Physics"
+      start_epoch: 81
+      end_epoch: 150
+      lambda_data: 1.0
+      lambda_pde: 0.05
+      lambda_bc: 0.1
+      lambda_scalar: 0.5
+      lr_scale: 0.5
+
+    # Phase 4: Fine-tuning
+    - name: "Refinement"
+      start_epoch: 151
+      end_epoch: 200
+      lambda_data: 1.0
+      lambda_pde: 0.05
+      lambda_bc: 0.1
+      lambda_scalar: 0.5
+      lr_scale: 0.1
+
+# =============================================================================
+# Output Configuration
+# =============================================================================
+output:
+  checkpoint_dir: "./experiments/pinn_improved"
+  save_best: true
+  save_history: true
+
+# =============================================================================
+# Device Configuration
+# =============================================================================
+device: "cuda"
+
+# =============================================================================
+# Experiment Tracking
+# =============================================================================
+experiment:
+  name: "pinn_improved"
+  tags: ["pinn", "cathodic_protection", "improved"]
+  notes: "Improved config with normalized scalar loss, lower LR, extended curriculum"
